@@ -513,9 +513,9 @@ def scheduled_stock_check(context: CallbackContext):
                             parse_mode=ParseMode.MARKDOWN
                         )
                         
-                        # Extra alerts (9 more = total 10)
+                        # 🔥 Extra alerts (9 more = total 10) - 3 SECOND DELAY
                         for i in range(9):
-                            time.sleep(2)
+                            time.sleep(3)  # 3 second delay
                             context.bot.send_message(
                                 chat_id=product['chat_id'],
                                 text=(
@@ -573,7 +573,7 @@ def run_health_server():
 def main():
     logger.info("=" * 60)
     logger.info("🔥 AMAZON STOCK TRACKER BOT - FINAL VERSION")
-    logger.info("✅ IN_STOCK: 10 alerts | OUT_OF_STOCK: 1 alert")
+    logger.info("✅ IN_STOCK: 10 alerts (3 sec gap) | OUT_OF_STOCK: 1 alert")
     logger.info("=" * 60)
     
     # Health server start karo
