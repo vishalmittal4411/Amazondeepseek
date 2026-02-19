@@ -145,7 +145,7 @@ class DatabaseManager:
             
             if not result:
                 logger.info("Adding last_status column to products table...")
-                self.execute("ALTER TABLE products ADD COLUMN last_status VARCHAR(20) DEFAULT 'UNKNOWN';")
+                self.execute("ALTER TABLE products ADD COLUMN last_status VARCHAR(20) DEFAULT 'OUT_OF_STOCK';")
             
             # Check if last_checked column exists
             result = self.execute("""
@@ -173,7 +173,7 @@ class DatabaseManager:
     def add_product(self, user_id, asin, title, url):
         self.execute("""
         INSERT INTO products (user_id, asin, title, url, last_status)
-        VALUES (%s, %s, %s, %s, 'UNKNOWN')
+        VALUES (%s, %s, %s, %s, 'OUT_OF_STOCK')
         ON CONFLICT (user_id, asin)
         DO UPDATE SET title = EXCLUDED.title, url = EXCLUDED.url
         """, (user_id, asin, title, url))
@@ -279,29 +279,37 @@ class AmazonScraper:
 
     @staticmethod
     def check_stock(url):
+        """Sirf IN_STOCK aur OUT_OF_STOCK return karega"""
         html_text = AmazonScraper.fetch_page(url)
         if not html_text:
-            return "UNKNOWN"
+            # Agar page load nahi hua to OUT_OF_STOCK
+            return "OUT_OF_STOCK"
 
         try:
             soup = BeautifulSoup(html_text, "lxml")
-            page_text = soup.get_text(" ").lower()
-
-            if "currently unavailable" in page_text or "out of stock" in page_text:
-                return "OUT_OF_STOCK"
-
+            
+            # Check for IN_STOCK indicators
             if soup.find(id="add-to-cart-button"):
                 return "IN_STOCK"
-
+            
             if soup.find(id="buy-now-button"):
                 return "IN_STOCK"
-
+            
+            # Check page text for buying options
+            page_text = soup.get_text(" ").lower()
             if "see all buying options" in page_text:
                 return "IN_STOCK"
-        except:
-            pass
-
-        return "UNKNOWN"
+            
+            # Check for out of stock indicators
+            if "currently unavailable" in page_text or "out of stock" in page_text:
+                return "OUT_OF_STOCK"
+            
+            # Agar kuch bhi match nahi hua to OUT_OF_STOCK
+            return "OUT_OF_STOCK"
+            
+        except Exception as e:
+            logger.error(f"Error checking stock: {e}")
+            return "OUT_OF_STOCK"
 
     @staticmethod
     def fetch_product_info(asin):
@@ -355,7 +363,7 @@ def list_products(update: Update, context: CallbackContext):
 
         msg = "📋 *Your Products:*\n\n"
         for i, p in enumerate(products, 1):
-            status_emoji = "🟢" if p.get('last_status') == 'IN_STOCK' else "🔴" if p.get('last_status') == 'OUT_OF_STOCK' else "⚪"
+            status_emoji = "🟢" if p.get('last_status') == 'IN_STOCK' else "🔴"
             msg += f"{i}. {status_emoji} {p['title'][:50]}...\n"
 
         update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
@@ -376,7 +384,7 @@ def status_check(update: Update, context: CallbackContext):
         msg = "📊 *Stock Status:*\n\n"
         for p in products:
             stock = AmazonScraper.check_stock(p["url"])
-            emoji = "🟢" if stock == "IN_STOCK" else "🔴" if stock == "OUT_OF_STOCK" else "⚪"
+            emoji = "🟢" if stock == "IN_STOCK" else "🔴"
             
             # Chota clickable link - sirf "🔗 Link" dikhega
             msg += f"{emoji} {p['title'][:50]}... [🔗 Link]({p['url']}) - `{stock}`\n"
@@ -429,7 +437,7 @@ def handle_message(update: Update, context: CallbackContext):
         info = AmazonScraper.fetch_product_info(asin)
         db.add_product(user_id, asin, info["title"], info["url"])
 
-        emoji = "🟢" if info["status"] == "IN_STOCK" else "🔴" if info["status"] == "OUT_OF_STOCK" else "⚪"
+        emoji = "🟢" if info["status"] == "IN_STOCK" else "🔴"
         update.message.reply_text(
             f"✅ *Product Added*\n\n"
             f"📦 {info['title'][:100]}\n\n"
@@ -464,10 +472,10 @@ def handle_remove_number(update: Update, context: CallbackContext):
         update.message.reply_text("❌ Error removing product.")
 
 # ================= STOCK CHECKER FUNCTION =================
-# Sirf IN_STOCK aur OUT_OF_STOCK ke alerts - UNKNOWN ignore
+# Sirf IN_STOCK aur OUT_OF_STOCK ke alerts
 
 def scheduled_stock_check(context: CallbackContext):
-    """Har 2 minute mein stock check karega - Sirf IN/OUT alerts"""
+    """Har 2 minute mein stock check karega"""
     logger.info("🔄 Running scheduled stock check...")
     
     try:
@@ -481,13 +489,13 @@ def scheduled_stock_check(context: CallbackContext):
         
         for product in products:
             try:
-                old_status = product.get('last_status', 'UNKNOWN')
+                old_status = product.get('last_status', 'OUT_OF_STOCK')
                 new_status = AmazonScraper.check_stock(product['url'])
                 
                 # Status update karo database mein
                 db.update_product_status(product['id'], new_status)
                 
-                # 🔥 ONLY ALERT ON ACTUAL STATUS CHANGES (ignore UNKNOWN)
+                # Sirf tab alert jab status actually change hua ho
                 if old_status != new_status:
                     
                     # Agar OUT_OF_STOCK se IN_STOCK hua to 10 alerts
@@ -533,9 +541,6 @@ def scheduled_stock_check(context: CallbackContext):
                             ),
                             parse_mode=ParseMode.MARKDOWN
                         )
-                    
-                    # 🔥 UNKNOWN se kuch bhi ho - IGNORE (koi alert nahi)
-                    # Sirf IN/STOCK OUT/STOCK ke alerts
                 
                 # Random delay to avoid Amazon blocking
                 time.sleep(random.randint(5, 10))
@@ -567,8 +572,8 @@ def run_health_server():
 
 def main():
     logger.info("=" * 60)
-    logger.info("🔥 AMAZON STOCK TRACKER BOT - CLEAN VERSION")
-    logger.info("✅ Sirf IN_STOCK (10 alerts) aur OUT_OF_STOCK (1 alert)")
+    logger.info("🔥 AMAZON STOCK TRACKER BOT - FINAL VERSION")
+    logger.info("✅ IN_STOCK: 10 alerts | OUT_OF_STOCK: 1 alert")
     logger.info("=" * 60)
     
     # Health server start karo
