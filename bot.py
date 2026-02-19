@@ -17,8 +17,8 @@ import os
 
 # ================= CONFIG =================
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-DATABASE_URL = os.environ.get("DATABASE_URL")
+BOT_TOKEN = os.environ.get("8183139776:AAHVnNr6kazdTmqbqQNwidgOUl2N6QPboB4")
+DATABASE_URL = os.environ.get("postgresql://postgres.edmovkglcqbyoichxxjm:NKmehta#61832@aws-1-ap-south-1.pooler.supabase.com:6543/postgres")
 
 if not BOT_TOKEN or not DATABASE_URL:
     raise ValueError("BOT_TOKEN and DATABASE_URL must be set in environment variables")
