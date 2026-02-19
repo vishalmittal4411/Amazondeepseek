@@ -21,9 +21,6 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 PORT = int(os.environ.get("PORT", 8080))
 
-# 🔥 ADMIN USER ID - SIRF AAP USE KAR SAKTE HAIN FORCE/RESTORE COMMANDS
-ADMIN_USER_ID = 1099246226
-
 if not BOT_TOKEN:
     print("❌ BOT_TOKEN environment variable not set!")
     sys.exit(1)
@@ -216,66 +213,6 @@ class DatabaseManager:
             "DELETE FROM products WHERE id=%s AND user_id=%s",
             (product_id, user_id)
         )
-    
-    # 🔥 Store original status before force out
-    def backup_original_status(self):
-        """Original status ka backup store karo"""
-        try:
-            products = self.execute("SELECT id, last_status FROM products", fetch_all=True) or []
-            for p in products:
-                self.execute("""
-                    UPDATE products 
-                    SET original_status = %s 
-                    WHERE id = %s
-                """, (p['last_status'], p['id']))
-            logger.info("✅ Original status backed up")
-            return True
-        except Exception as e:
-            logger.error(f"Backup error: {e}")
-            return False
-    
-    # 🔥 Force all products OUT_OF_STOCK
-    def force_out_of_stock(self):
-        """Testing ke liye saare products OUT_OF_STOCK karo"""
-        try:
-            # Pehle original status backup karo
-            self.execute("""
-                ALTER TABLE products 
-                ADD COLUMN IF NOT EXISTS original_status VARCHAR(20)
-            """)
-            
-            # Original status save karo
-            self.execute("""
-                UPDATE products 
-                SET original_status = last_status 
-                WHERE original_status IS NULL
-            """)
-            
-            # Ab OUT_OF_STOCK karo
-            self.execute("""
-                UPDATE products 
-                SET last_status = 'OUT_OF_STOCK', last_checked = NOW() 
-            """)
-            logger.info("✅ All products forced to OUT_OF_STOCK")
-            return True
-        except Exception as e:
-            logger.error(f"Force out error: {e}")
-            return False
-    
-    # 🔥 Restore original status
-    def restore_original_status(self):
-        """Original status wapas lao"""
-        try:
-            self.execute("""
-                UPDATE products 
-                SET last_status = original_status, last_checked = NOW() 
-                WHERE original_status IS NOT NULL
-            """)
-            logger.info("✅ Original status restored")
-            return True
-        except Exception as e:
-            logger.error(f"Restore error: {e}")
-            return False
 
 # ================= AMAZON SCRAPER =================
 
@@ -391,60 +328,9 @@ def error_handler(update: Update, context: CallbackContext):
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
 
-# 🔥 FORCE OUT COMMAND - SIRF AAP USE KAR SAKTE HAIN
-def force_out(update: Update, context: CallbackContext):
-    """Testing: Saare products OUT_OF_STOCK karo"""
-    try:
-        # Sirf admin use kar sakta hai
-        if update.effective_user.id != ADMIN_USER_ID:
-            update.message.reply_text("❌ *Unauthorized*", parse_mode=ParseMode.MARKDOWN)
-            return
-        
-        # Force out karo
-        if db.force_out_of_stock():
-            update.message.reply_text(
-                "🔴 *Force OUT_OF_STOCK*\n\n"
-                "✅ Saare products OUT_OF_STOCK kar diye gaye!\n"
-                "⚠️ 2 minute mein check hoga aur IN_STOCK hote hi 10 alerts aayenge!\n\n"
-                "Use /restore to revert to original status",
-                parse_mode=ParseMode.MARKDOWN
-            )
-        else:
-            update.message.reply_text("❌ Error occurred.", parse_mode=ParseMode.MARKDOWN)
-        
-    except Exception as e:
-        logger.error(f"Force out error: {e}")
-        update.message.reply_text("❌ Error occurred.")
-
-# 🔥 RESTORE COMMAND - SIRF AAP USE KAR SAKTE HAIN
-def restore(update: Update, context: CallbackContext):
-    """Original status wapas lao"""
-    try:
-        # Sirf admin use kar sakta hai
-        if update.effective_user.id != ADMIN_USER_ID:
-            update.message.reply_text("❌ *Unauthorized*", parse_mode=ParseMode.MARKDOWN)
-            return
-        
-        # Restore karo
-        if db.restore_original_status():
-            update.message.reply_text(
-                "🟢 *Status Restored*\n\n"
-                "✅ Saare products ki original status wapas aa gayi!",
-                parse_mode=ParseMode.MARKDOWN
-            )
-        else:
-            update.message.reply_text("❌ Error occurred.", parse_mode=ParseMode.MARKDOWN)
-        
-    except Exception as e:
-        logger.error(f"Restore error: {e}")
-        update.message.reply_text("❌ Error occurred.")
-
 def start(update: Update, context: CallbackContext):
     try:
         db.add_user(update.effective_user.id, update.effective_chat.id)
-        
-        # Admin hai ya normal user
-        is_admin = (update.effective_user.id == ADMIN_USER_ID)
         
         msg = "✅ *Bot Activated*\n\n"
         msg += "Commands:\n"
@@ -452,11 +338,6 @@ def start(update: Update, context: CallbackContext):
         msg += "/list 📋 Show products\n"
         msg += "/status 📊 Check stock\n"
         msg += "/remove 🗑 Remove product\n"
-        
-        if is_admin:
-            msg += "\n*Admin Commands:*\n"
-            msg += "/force_out 🔴 Force all OUT OF STOCK\n"
-            msg += "/restore 🟢 Restore original status\n"
         
         update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
@@ -583,9 +464,10 @@ def handle_remove_number(update: Update, context: CallbackContext):
         update.message.reply_text("❌ Error removing product.")
 
 # ================= STOCK CHECKER FUNCTION =================
+# Sirf IN_STOCK aur OUT_OF_STOCK ke alerts - UNKNOWN ignore
 
 def scheduled_stock_check(context: CallbackContext):
-    """Har 2 minute mein stock check karega"""
+    """Har 2 minute mein stock check karega - Sirf IN/OUT alerts"""
     logger.info("🔄 Running scheduled stock check...")
     
     try:
@@ -605,51 +487,55 @@ def scheduled_stock_check(context: CallbackContext):
                 # Status update karo database mein
                 db.update_product_status(product['id'], new_status)
                 
-                # Agar OUT_OF_STOCK se IN_STOCK hua to alert bhejo
-                if old_status == 'OUT_OF_STOCK' and new_status == 'IN_STOCK':
-                    logger.info(f"🔥 STOCK ALERT: {product['asin']} is back in stock!")
+                # 🔥 ONLY ALERT ON ACTUAL STATUS CHANGES (ignore UNKNOWN)
+                if old_status != new_status:
                     
-                    # Pehla alert
-                    context.bot.send_message(
-                        chat_id=product['chat_id'],
-                        text=(
-                            f"🔥 *BACK IN STOCK!*\n\n"
-                            f"📦 *{product['title']}*\n\n"
-                            f"🔗 [View on Amazon]({product['url']})"
-                        ),
-                        parse_mode=ParseMode.MARKDOWN
-                    )
-                    
-                    # Extra alerts (9 more = total 10)
-                    for i in range(9):
-                        time.sleep(2)
+                    # Agar OUT_OF_STOCK se IN_STOCK hua to 10 alerts
+                    if old_status == 'OUT_OF_STOCK' and new_status == 'IN_STOCK':
+                        logger.info(f"🔥 STOCK ALERT: {product['asin']} is back in stock!")
+                        
+                        # Pehla alert
                         context.bot.send_message(
                             chat_id=product['chat_id'],
                             text=(
-                                f"🔥 *BACK IN STOCK!* (Alert {i+2}/10)\n\n"
+                                f"🔥 *BACK IN STOCK!*\n\n"
+                                f"📦 *{product['title']}*\n\n"
+                                f"🔗 [View on Amazon]({product['url']})"
+                            ),
+                            parse_mode=ParseMode.MARKDOWN
+                        )
+                        
+                        # Extra alerts (9 more = total 10)
+                        for i in range(9):
+                            time.sleep(2)
+                            context.bot.send_message(
+                                chat_id=product['chat_id'],
+                                text=(
+                                    f"🔥 *BACK IN STOCK!* (Alert {i+2}/10)\n\n"
+                                    f"📦 *{product['title']}*\n\n"
+                                    f"🔗 [View on Amazon]({product['url']})"
+                                ),
+                                parse_mode=ParseMode.MARKDOWN
+                            )
+                        
+                        logger.info(f"✅ Sent 10 alerts for {product['asin']}")
+                    
+                    # Agar IN_STOCK se OUT_OF_STOCK hua to 1 alert
+                    elif old_status == 'IN_STOCK' and new_status == 'OUT_OF_STOCK':
+                        logger.info(f"📉 OUT OF STOCK: {product['asin']}")
+                        
+                        context.bot.send_message(
+                            chat_id=product['chat_id'],
+                            text=(
+                                f"📉 *OUT OF STOCK*\n\n"
                                 f"📦 *{product['title']}*\n\n"
                                 f"🔗 [View on Amazon]({product['url']})"
                             ),
                             parse_mode=ParseMode.MARKDOWN
                         )
                     
-                    logger.info(f"✅ Sent 10 alerts for {product['asin']}")
-                
-                # Agar status kuch bhi change hua (UNKNOWN se kuch bhi)
-                elif old_status != new_status and old_status != 'UNKNOWN':
-                    logger.info(f"📊 Status changed: {product['asin']} from {old_status} to {new_status}")
-                    
-                    emoji = "🟢" if new_status == "IN_STOCK" else "🔴"
-                    context.bot.send_message(
-                        chat_id=product['chat_id'],
-                        text=(
-                            f"📊 *Status Updated*\n\n"
-                            f"📦 *{product['title']}*\n\n"
-                            f"Status: {emoji} {new_status}\n\n"
-                            f"🔗 [View on Amazon]({product['url']})"
-                        ),
-                        parse_mode=ParseMode.MARKDOWN
-                    )
+                    # 🔥 UNKNOWN se kuch bhi ho - IGNORE (koi alert nahi)
+                    # Sirf IN/STOCK OUT/STOCK ke alerts
                 
                 # Random delay to avoid Amazon blocking
                 time.sleep(random.randint(5, 10))
@@ -681,8 +567,8 @@ def run_health_server():
 
 def main():
     logger.info("=" * 60)
-    logger.info("🔥 AMAZON STOCK TRACKER BOT - WITH FORCE/RESTORE")
-    logger.info(f"👤 Admin ID: {ADMIN_USER_ID}")
+    logger.info("🔥 AMAZON STOCK TRACKER BOT - CLEAN VERSION")
+    logger.info("✅ Sirf IN_STOCK (10 alerts) aur OUT_OF_STOCK (1 alert)")
     logger.info("=" * 60)
     
     # Health server start karo
@@ -719,10 +605,6 @@ def main():
     dp.add_handler(CommandHandler("list", list_products))
     dp.add_handler(CommandHandler("status", status_check))
     dp.add_handler(CommandHandler("remove", remove))
-    
-    # 🔥 Force and Restore commands (admin only)
-    dp.add_handler(CommandHandler("force_out", force_out))
-    dp.add_handler(CommandHandler("restore", restore))
     
     # Message handler
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
