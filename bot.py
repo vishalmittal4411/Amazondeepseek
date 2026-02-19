@@ -9,7 +9,7 @@ from bs4 import BeautifulSoup
 from psycopg2 import pool
 from psycopg2.extras import DictCursor
 from telegram import Update, ParseMode
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext, JobQueue
 from telegram.error import TelegramError, NetworkError, Conflict, TimedOut
 from flask import Flask
 import threading
@@ -17,10 +17,9 @@ import os
 import sys
 
 # ================= CONFIG FROM ENVIRONMENT =================
-# Ye dono Render environment se automatically lenge
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL")
-PORT = int(os.environ.get("PORT", 8080))  # Render automatically PORT set karta hai
+PORT = int(os.environ.get("PORT", 8080))
 
 if not BOT_TOKEN:
     print("❌ BOT_TOKEN environment variable not set!")
@@ -59,17 +58,17 @@ class DatabaseManager:
         self.connect_with_retry()
 
     def connect_with_retry(self):
-        """Database se connect hone ki retry"""
         max_retries = 10
         for attempt in range(max_retries):
             try:
                 self.pool = pool.SimpleConnectionPool(
                     1, 5,
-                    DATABASE_URL,  # Environment se liya
+                    DATABASE_URL,
                     cursor_factory=DictCursor
                 )
                 logger.info("✅ Database pool created")
                 self.create_tables()
+                self.add_missing_columns()
                 return
             except Exception as e:
                 logger.error(f"Database connection failed (attempt {attempt+1}/{max_retries}): {e}")
@@ -134,6 +133,35 @@ class DatabaseManager:
         );
         """)
 
+    def add_missing_columns(self):
+        """Add last_status and last_checked columns if they don't exist"""
+        try:
+            # Check if last_status column exists
+            result = self.execute("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name='products' AND column_name='last_status'
+            """, fetch_all=True)
+            
+            if not result:
+                logger.info("Adding last_status column to products table...")
+                self.execute("ALTER TABLE products ADD COLUMN last_status VARCHAR(20) DEFAULT 'UNKNOWN';")
+            
+            # Check if last_checked column exists
+            result = self.execute("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name='products' AND column_name='last_checked'
+            """, fetch_all=True)
+            
+            if not result:
+                logger.info("Adding last_checked column to products table...")
+                self.execute("ALTER TABLE products ADD COLUMN last_checked TIMESTAMP;")
+                
+            logger.info("✅ Database columns verified")
+        except Exception as e:
+            logger.error(f"Error adding columns: {e}")
+
     def add_user(self, user_id, chat_id):
         self.execute("""
         INSERT INTO users (user_id, chat_id)
@@ -144,10 +172,10 @@ class DatabaseManager:
 
     def add_product(self, user_id, asin, title, url):
         self.execute("""
-        INSERT INTO products (user_id, asin, title, url)
-        VALUES (%s, %s, %s, %s)
+        INSERT INTO products (user_id, asin, title, url, last_status)
+        VALUES (%s, %s, %s, %s, 'UNKNOWN')
         ON CONFLICT (user_id, asin)
-        DO UPDATE SET title=EXCLUDED.title
+        DO UPDATE SET title = EXCLUDED.title, url = EXCLUDED.url
         """, (user_id, asin, title, url))
 
     def get_products(self, user_id):
@@ -158,6 +186,27 @@ class DatabaseManager:
             ) or []
         except:
             return []
+
+    def get_all_products_with_users(self):
+        """Sabhi products with user chat_id fetch karo"""
+        try:
+            return self.execute("""
+                SELECT p.*, u.chat_id 
+                FROM products p
+                JOIN users u ON u.user_id = p.user_id
+                ORDER BY p.id
+            """, fetch_all=True) or []
+        except Exception as e:
+            logger.error(f"Error fetching all products: {e}")
+            return []
+
+    def update_product_status(self, product_id, status):
+        """Product ka status update karo"""
+        self.execute("""
+            UPDATE products 
+            SET last_status = %s, last_checked = NOW() 
+            WHERE id = %s
+        """, (status, product_id))
 
     def remove_product(self, product_id, user_id):
         self.execute(
@@ -266,7 +315,6 @@ class AmazonScraper:
 db = DatabaseManager()
 
 def error_handler(update: Update, context: CallbackContext):
-    """Global error handler - bot crash hone se bachata hai"""
     try:
         raise context.error
     except Conflict:
@@ -297,7 +345,6 @@ def start(update: Update, context: CallbackContext):
         update.message.reply_text("❌ Error occurred. Please try again.")
 
 def list_products(update: Update, context: CallbackContext):
-    """Sirf products ki list dikhao"""
     user_id = update.effective_user.id
     try:
         products = db.get_products(user_id)
@@ -308,7 +355,8 @@ def list_products(update: Update, context: CallbackContext):
 
         msg = "📋 *Your Products:*\n\n"
         for i, p in enumerate(products, 1):
-            msg += f"{i}. {p['title'][:50]}...\n"
+            status_emoji = "🟢" if p.get('last_status') == 'IN_STOCK' else "🔴" if p.get('last_status') == 'OUT_OF_STOCK' else "⚪"
+            msg += f"{i}. {status_emoji} {p['title'][:50]}...\n"
 
         update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
@@ -316,7 +364,6 @@ def list_products(update: Update, context: CallbackContext):
         update.message.reply_text("❌ Error fetching list.")
 
 def status_check(update: Update, context: CallbackContext):
-    """Products ki stock status check karo"""
     user_id = update.effective_user.id
     try:
         products = db.get_products(user_id)
@@ -330,7 +377,10 @@ def status_check(update: Update, context: CallbackContext):
             stock = AmazonScraper.check_stock(p["url"])
             emoji = "🟢" if stock == "IN_STOCK" else "🔴" if stock == "OUT_OF_STOCK" else "⚪"
             msg += f"{emoji} {p['title'][:50]}... - `{stock}`\n"
-            time.sleep(2)  # Amazon pe load kam karne ke liye
+            
+            # Update status in database
+            db.update_product_status(p['id'], stock)
+            time.sleep(2)
 
         update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
@@ -359,14 +409,11 @@ def remove(update: Update, context: CallbackContext):
 
 def handle_message(update: Update, context: CallbackContext):
     try:
-        # Pehle check karo removal mode mein hai ya nahi
         if "remove_list" in context.user_data:
             handle_remove_number(update, context)
             return
 
         user_id = update.effective_user.id
-        
-        # Ensure user exists
         db.add_user(user_id, update.effective_chat.id)
 
         asin = AmazonScraper.extract_asin(update.message.text)
@@ -413,6 +460,82 @@ def handle_remove_number(update: Update, context: CallbackContext):
         logger.error(f"Remove number error: {e}")
         update.message.reply_text("❌ Error removing product.")
 
+# ================= STOCK CHECKER FUNCTION =================
+
+def scheduled_stock_check(context: CallbackContext):
+    """Har 5 minute mein stock check karega"""
+    logger.info("🔄 Running scheduled stock check...")
+    
+    try:
+        products = db.get_all_products_with_users()
+        
+        if not products:
+            logger.info("No products to check")
+            return
+            
+        logger.info(f"Checking {len(products)} products")
+        
+        for product in products:
+            try:
+                old_status = product.get('last_status', 'UNKNOWN')
+                new_status = AmazonScraper.check_stock(product['url'])
+                
+                # Status update karo database mein
+                db.update_product_status(product['id'], new_status)
+                
+                # Agar OUT_OF_STOCK se IN_STOCK hua to alert bhejo
+                if old_status == 'OUT_OF_STOCK' and new_status == 'IN_STOCK':
+                    logger.info(f"🔥 STOCK ALERT: {product['asin']} is back in stock!")
+                    
+                    # User ko alert bhejo
+                    context.bot.send_message(
+                        chat_id=product['chat_id'],
+                        text=(
+                            f"🔥 *BACK IN STOCK!*\n\n"
+                            f"📦 *{product['title']}*\n\n"
+                            f"🔗 [View on Amazon]({product['url']})"
+                        ),
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                    
+                    # Extra alerts (10 times)
+                    for i in range(9):  # 9 more times (total 10)
+                        time.sleep(2)
+                        context.bot.send_message(
+                            chat_id=product['chat_id'],
+                            text=(
+                                f"🔥 *BACK IN STOCK!* (Alert {i+2}/10)\n\n"
+                                f"📦 *{product['title']}*\n\n"
+                                f"🔗 [View on Amazon]({product['url']})"
+                            ),
+                            parse_mode=ParseMode.MARKDOWN
+                        )
+                
+                # Agar status kuch bhi change hua (UNKNOWN se kuch bhi)
+                elif old_status != new_status and old_status != 'UNKNOWN':
+                    logger.info(f"📊 Status changed: {product['asin']} from {old_status} to {new_status}")
+                    
+                    emoji = "🟢" if new_status == "IN_STOCK" else "🔴"
+                    context.bot.send_message(
+                        chat_id=product['chat_id'],
+                        text=(
+                            f"📊 *Status Updated*\n\n"
+                            f"📦 *{product['title']}*\n\n"
+                            f"Status: {emoji} {new_status}"
+                        ),
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                
+                # Random delay to avoid Amazon blocking
+                time.sleep(random.randint(5, 10))
+                
+            except Exception as e:
+                logger.error(f"Error checking product {product.get('asin', 'unknown')}: {e}")
+                continue
+                
+    except Exception as e:
+        logger.error(f"Stock check error: {e}")
+
 # ================= HEALTH CHECK ENDPOINT =================
 
 health_app = Flask(__name__)
@@ -429,77 +552,19 @@ def run_health_server():
     """Health check server alag thread mein chalao"""
     health_app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
 
-# ================= MAIN WITH SUPER AUTO-RESTART =================
-
-def run_bot():
-    """Bot ko run karo - agar crash ho to restart"""
-    restart_count = 0
-    
-    while True:
-        try:
-            restart_count += 1
-            logger.info(f"🚀 Starting bot (attempt {restart_count})...")
-            
-            updater = Updater(token=BOT_TOKEN, use_context=True)
-            dp = updater.dispatcher
-
-            # Command handlers
-            dp.add_handler(CommandHandler("start", start))
-            dp.add_handler(CommandHandler("add", add))
-            dp.add_handler(CommandHandler("list", list_products))
-            dp.add_handler(CommandHandler("status", status_check))
-            dp.add_handler(CommandHandler("remove", remove))
-            
-            # Message handler
-            dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
-            
-            # Error handler
-            dp.add_error_handler(error_handler)
-
-            logger.info("✅ Bot is running!")
-            
-            # Polling with low timeout to detect disconnections
-            updater.start_polling(
-                drop_pending_updates=True,
-                timeout=30,
-                poll_interval=1.0
-            )
-            
-            # Idle with health check
-            while True:
-                time.sleep(10)
-                # Health check - if bot is still connected
-                try:
-                    updater.bot.get_me()
-                except:
-                    logger.warning("Health check failed, restarting...")
-                    break
-                    
-        except Conflict:
-            logger.warning("⚠️ Conflict error - waiting 30 seconds...")
-            time.sleep(30)
-        except (NetworkError, TimedOut) as e:
-            logger.warning(f"⚠️ Network error: {e} - waiting 20 seconds...")
-            time.sleep(20)
-        except Exception as e:
-            logger.error(f"❌ Bot crashed: {e}")
-            
-            # Exponential backoff for restart
-            wait_time = min(30, 5 * (2 ** min(restart_count, 5)))
-            logger.info(f"⏰ Restarting in {wait_time} seconds...")
-            time.sleep(wait_time)
+# ================= MAIN =================
 
 def main():
     logger.info("=" * 60)
-    logger.info("🔥 AMAZON STOCK TRACKER BOT - RENDER READY")
+    logger.info("🔥 AMAZON STOCK TRACKER BOT - WITH AUTO ALERTS")
     logger.info("=" * 60)
     
-    # Health server start karo (alag thread mein)
+    # Health server start karo
     health_thread = threading.Thread(target=run_health_server, daemon=True)
     health_thread.start()
     logger.info(f"✅ Health server running on port {PORT}")
     
-    # Database initialize
+    # Database check
     try:
         db.create_tables()
         logger.info("✅ Database ready")
@@ -509,8 +574,42 @@ def main():
         main()
         return
     
-    # Run bot with auto-restart
-    run_bot()
+    # Bot setup
+    updater = Updater(token=BOT_TOKEN, use_context=True)
+    
+    # Delete webhook to avoid conflicts
+    try:
+        updater.bot.delete_webhook()
+        logger.info("✅ Webhook deleted")
+    except:
+        pass
+    
+    dp = updater.dispatcher
+    job_queue = updater.job_queue
+    
+    # Command handlers
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("add", add))
+    dp.add_handler(CommandHandler("list", list_products))
+    dp.add_handler(CommandHandler("status", status_check))
+    dp.add_handler(CommandHandler("remove", remove))
+    
+    # Message handler
+    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
+    
+    # Error handler
+    dp.add_error_handler(error_handler)
+    
+    # 🔥 Schedule stock check every 5 minutes (300 seconds)
+    job_queue.run_repeating(scheduled_stock_check, interval=300, first=30)
+    logger.info("✅ Stock checker scheduled (every 5 minutes)")
+    
+    # Start bot
+    updater.start_polling()
+    logger.info("✅ Bot is running!")
+    
+    # Keep running
+    updater.idle()
 
 if __name__ == "__main__":
     main()
