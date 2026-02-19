@@ -14,14 +14,21 @@ from telegram.error import TelegramError, NetworkError, Conflict, TimedOut
 from flask import Flask
 import threading
 import os
+import sys
 
-# ================= CONFIG =================
+# ================= CONFIG FROM ENVIRONMENT =================
+# Ye dono Render environment se automatically lenge
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+DATABASE_URL = os.environ.get("DATABASE_URL")
+PORT = int(os.environ.get("PORT", 8080))  # Render automatically PORT set karta hai
 
-BOT_TOKEN = os.environ.get("8183139776:AAHVnNr6kazdTmqbqQNwidgOUl2N6QPboB4")
-DATABASE_URL = os.environ.get("postgresql://postgres.edmovkglcqbyoichxxjm:NKmehta#61832@aws-1-ap-south-1.pooler.supabase.com:6543/postgres")
+if not BOT_TOKEN:
+    print("❌ BOT_TOKEN environment variable not set!")
+    sys.exit(1)
 
-if not BOT_TOKEN or not DATABASE_URL:
-    raise ValueError("BOT_TOKEN and DATABASE_URL must be set in environment variables")
+if not DATABASE_URL:
+    print("❌ DATABASE_URL environment variable not set!")
+    sys.exit(1)
 
 # ================= LOGGING =================
 
@@ -58,7 +65,7 @@ class DatabaseManager:
             try:
                 self.pool = pool.SimpleConnectionPool(
                     1, 5,
-                    DATABASE_URL,
+                    DATABASE_URL,  # Environment se liya
                     cursor_factory=DictCursor
                 )
                 logger.info("✅ Database pool created")
@@ -323,7 +330,7 @@ def status_check(update: Update, context: CallbackContext):
             stock = AmazonScraper.check_stock(p["url"])
             emoji = "🟢" if stock == "IN_STOCK" else "🔴" if stock == "OUT_OF_STOCK" else "⚪"
             msg += f"{emoji} {p['title'][:50]}... - `{stock}`\n"
-            time.sleep(2)
+            time.sleep(2)  # Amazon pe load kam karne ke liye
 
         update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
@@ -352,11 +359,14 @@ def remove(update: Update, context: CallbackContext):
 
 def handle_message(update: Update, context: CallbackContext):
     try:
+        # Pehle check karo removal mode mein hai ya nahi
         if "remove_list" in context.user_data:
             handle_remove_number(update, context)
             return
 
         user_id = update.effective_user.id
+        
+        # Ensure user exists
         db.add_user(user_id, update.effective_chat.id)
 
         asin = AmazonScraper.extract_asin(update.message.text)
@@ -417,8 +427,7 @@ def health():
 
 def run_health_server():
     """Health check server alag thread mein chalao"""
-    port = int(os.environ.get('PORT', 8080))
-    health_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+    health_app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
 
 # ================= MAIN WITH SUPER AUTO-RESTART =================
 
@@ -434,25 +443,32 @@ def run_bot():
             updater = Updater(token=BOT_TOKEN, use_context=True)
             dp = updater.dispatcher
 
+            # Command handlers
             dp.add_handler(CommandHandler("start", start))
             dp.add_handler(CommandHandler("add", add))
             dp.add_handler(CommandHandler("list", list_products))
             dp.add_handler(CommandHandler("status", status_check))
             dp.add_handler(CommandHandler("remove", remove))
             
+            # Message handler
             dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
+            
+            # Error handler
             dp.add_error_handler(error_handler)
 
             logger.info("✅ Bot is running!")
             
+            # Polling with low timeout to detect disconnections
             updater.start_polling(
                 drop_pending_updates=True,
                 timeout=30,
                 poll_interval=1.0
             )
             
+            # Idle with health check
             while True:
                 time.sleep(10)
+                # Health check - if bot is still connected
                 try:
                     updater.bot.get_me()
                 except:
@@ -467,6 +483,8 @@ def run_bot():
             time.sleep(20)
         except Exception as e:
             logger.error(f"❌ Bot crashed: {e}")
+            
+            # Exponential backoff for restart
             wait_time = min(30, 5 * (2 ** min(restart_count, 5)))
             logger.info(f"⏰ Restarting in {wait_time} seconds...")
             time.sleep(wait_time)
@@ -476,10 +494,12 @@ def main():
     logger.info("🔥 AMAZON STOCK TRACKER BOT - RENDER READY")
     logger.info("=" * 60)
     
+    # Health server start karo (alag thread mein)
     health_thread = threading.Thread(target=run_health_server, daemon=True)
     health_thread.start()
-    logger.info(f"✅ Health server running on port {os.environ.get('PORT', 8080)}")
+    logger.info(f"✅ Health server running on port {PORT}")
     
+    # Database initialize
     try:
         db.create_tables()
         logger.info("✅ Database ready")
@@ -487,7 +507,9 @@ def main():
         logger.critical(f"Database error: {e}")
         time.sleep(5)
         main()
+        return
     
+    # Run bot with auto-restart
     run_bot()
 
 if __name__ == "__main__":
