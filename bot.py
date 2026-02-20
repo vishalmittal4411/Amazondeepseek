@@ -130,7 +130,6 @@ class DatabaseManager:
         """)
 
     def add_price_columns_if_not_exist(self):
-        """Check and add price columns if missing"""
         try:
             check_query = """
                 SELECT column_name 
@@ -281,10 +280,8 @@ class AmazonScraper:
             soup = BeautifulSoup(html_text, "lxml")
             tag = soup.find(id="productTitle")
             if tag:
-                # Clean title - remove extra spaces and fix encoding
                 title = tag.get_text(strip=True)
                 title = html.unescape(title)
-                # Remove any markdown characters that could cause issues
                 title = title.replace('*', '•').replace('_', ' ').replace('[', '(').replace(']', ')')
                 return title
 
@@ -352,8 +349,10 @@ class AmazonScraper:
         
         return 0
 
+    # 🔥 FIXED: More accurate stock detection
     @staticmethod
     def check_stock(url, html_text=None):
+        """More accurate stock detection - checks main product area only"""
         if not html_text:
             html_text = AmazonScraper.fetch_page(url)
             if not html_text:
@@ -361,23 +360,89 @@ class AmazonScraper:
 
         try:
             soup = BeautifulSoup(html_text, "lxml")
-            page_text = soup.get_text(" ").lower()
-
-            if "currently unavailable" in page_text or "out of stock" in page_text:
-                return "OUT_OF_STOCK"
-
+            
+            # METHOD 1: Check for buy buttons first (most reliable)
             if soup.find(id="add-to-cart-button"):
+                logger.info("✅ Found add-to-cart button → IN_STOCK")
                 return "IN_STOCK"
-
+            
             if soup.find(id="buy-now-button"):
+                logger.info("✅ Found buy-now button → IN_STOCK")
                 return "IN_STOCK"
-
-            if "see all buying options" in page_text:
+            
+            if soup.find(id="buy-now"):
+                logger.info("✅ Found buy-now → IN_STOCK")
                 return "IN_STOCK"
-        except:
-            pass
-
-        return "UNKNOWN"
+            
+            # METHOD 2: Check availability span
+            availability = soup.find(id="availability")
+            if availability:
+                avail_text = availability.get_text().lower()
+                if "in stock" in avail_text:
+                    logger.info("✅ Availability span says IN STOCK")
+                    return "IN_STOCK"
+                elif "out of stock" in avail_text or "currently unavailable" in avail_text:
+                    logger.info("❌ Availability span says OUT OF STOCK")
+                    return "OUT_OF_STOCK"
+            
+            # METHOD 3: Check main product area only (not footer)
+            main_content = soup.find('div', {'id': 'centerCol'}) or soup.find('div', {'id': 'rightCol'}) or soup.find('div', {'class': 'a-section'})
+            
+            if main_content:
+                main_text = main_content.get_text().lower()
+                
+                # IN_STOCK indicators in main area
+                if "add to cart" in main_text:
+                    logger.info("✅ 'add to cart' in main area → IN_STOCK")
+                    return "IN_STOCK"
+                
+                if "buy now" in main_text:
+                    logger.info("✅ 'buy now' in main area → IN_STOCK")
+                    return "IN_STOCK"
+                
+                # OUT_OF_STOCK indicators in main area
+                if "out of stock" in main_text:
+                    logger.info("❌ 'out of stock' in main area → OUT_OF_STOCK")
+                    return "OUT_OF_STOCK"
+                
+                if "currently unavailable" in main_text:
+                    logger.info("❌ 'currently unavailable' in main area → OUT_OF_STOCK")
+                    return "OUT_OF_STOCK"
+            
+            # METHOD 4: Check page title/header
+            product_title = soup.find(id="productTitle")
+            if product_title:
+                title_area = product_title.find_next('div')
+                if title_area:
+                    area_text = title_area.get_text().lower()
+                    if "out of stock" in area_text or "currently unavailable" in area_text:
+                        logger.info("❌ Found OOS near title → OUT_OF_STOCK")
+                        return "OUT_OF_STOCK"
+            
+            # METHOD 5: Last resort - check whole page but with caution
+            page_text = soup.get_text(" ").lower()
+            
+            # Count occurrences
+            oos_count = page_text.count("out of stock") + page_text.count("currently unavailable")
+            instock_count = page_text.count("add to cart") + page_text.count("buy now")
+            
+            # If we see buy buttons more than OOS text, assume IN_STOCK
+            if instock_count > oos_count:
+                logger.info(f"✅ Buy buttons ({instock_count}) > OOS text ({oos_count}) → IN_STOCK")
+                return "IN_STOCK"
+            
+            # If OOS text is prominent, return OUT_OF_STOCK
+            if oos_count > 0:
+                logger.info(f"❌ Found OOS text ({oos_count} times) → OUT_OF_STOCK")
+                return "OUT_OF_STOCK"
+            
+            # Default
+            logger.info("⚠️ Could not determine, defaulting to UNKNOWN")
+            return "UNKNOWN"
+            
+        except Exception as e:
+            logger.error(f"Error checking stock: {e}")
+            return "UNKNOWN"
 
     @staticmethod
     def fetch_product_info(asin):
@@ -410,7 +475,6 @@ def start(update: Update, context: CallbackContext):
     try:
         db.add_user(update.effective_user.id, update.effective_chat.id)
         
-        # Simple message without complex formatting
         msg = (
             "✅ *Amazon Tracker Activated*\n\n"
             "Commands:\n"
@@ -463,7 +527,6 @@ def status_check(update: Update, context: CallbackContext):
                 db.update_product_price(p['id'], price)
             db.update_product_status(p['id'], stock)
             
-            # Simple display
             status_emoji = "✅" if stock == "IN_STOCK" else "❌"
             if stock == "IN_STOCK" and price:
                 price_display = f"₹{price:,.0f}"
@@ -517,7 +580,7 @@ def handle_message(update: Update, context: CallbackContext):
         info = AmazonScraper.fetch_product_info(asin)
         db.add_product(user_id, asin, info["title"], info["url"], info["price"])
 
-        status_text = "IN STOCK" if info["status"] == "IN_STOCK" else "OUT OF STOCK"
+        status_text = "IN STOCK" if info["status"] == "IN_STOCK" else "OUT OF STOCK" if info["status"] == "OUT_OF_STOCK" else "UNKNOWN"
         price_text = f"₹{info['price']:,.0f}" if info['price'] else "Price N/A"
         
         update.message.reply_text(
@@ -640,7 +703,7 @@ def run_health_server():
 # ================= MAIN =================
 def main():
     logger.info("=" * 50)
-    logger.info("AMAZON BOT STARTING")
+    logger.info("AMAZON BOT - FIXED STOCK DETECTION")
     logger.info("=" * 50)
     
     # Health server
