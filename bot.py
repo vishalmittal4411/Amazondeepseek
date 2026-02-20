@@ -10,7 +10,7 @@ from psycopg2 import pool
 from psycopg2.extras import DictCursor
 from telegram import Update, ParseMode
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
-from telegram.error import TelegramError, NetworkError, Conflict, TimedOut
+from telegram.error import TelegramError
 from flask import Flask
 import threading
 import os
@@ -26,10 +26,7 @@ if not BOT_TOKEN or not DATABASE_URL:
     print("Environment variables missing!")
     sys.exit(1)
 
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ================= DATABASE =================
@@ -42,13 +39,9 @@ class DatabaseManager:
         with cls._lock:
             if cls._instance is None:
                 cls._instance = super().__new__(cls)
-                cls._instance._initialized = False
         return cls._instance
 
     def __init__(self):
-        if self._initialized:
-            return
-        self._initialized = True
         self.pool = pool.SimpleConnectionPool(
             1, 5,
             DATABASE_URL,
@@ -166,45 +159,32 @@ class AmazonScraper:
         return None
 
     @staticmethod
-    def fetch_title(url, asin):
+    def fetch_product_data(url):
         html_text = AmazonScraper.fetch_page(url)
         if not html_text:
-            return f"Product {asin}"
-
-        soup = BeautifulSoup(html_text, "lxml")
-        tag = soup.find(id="productTitle")
-        if tag:
-            return html.unescape(tag.get_text(strip=True))
-        return f"Product {asin}"
-
-    @staticmethod
-    def check_stock(url):
-        html_text = AmazonScraper.fetch_page(url)
-        if not html_text:
-            return "OUT_OF_STOCK"
+            return {"stock": "OUT_OF_STOCK", "price": None}
 
         soup = BeautifulSoup(html_text, "lxml")
         page_text = soup.get_text(" ").lower()
 
-        if "currently unavailable" in page_text:
-            return "OUT_OF_STOCK"
+        # Stock
+        if "currently unavailable" in page_text or "out of stock" in page_text:
+            stock = "OUT_OF_STOCK"
+        elif ("add to cart" in page_text
+              or "buy now" in page_text
+              or "see all buying options" in page_text
+              or "1 option from" in page_text):
+            stock = "IN_STOCK"
+        else:
+            stock = "OUT_OF_STOCK"
 
-        if "out of stock" in page_text:
-            return "OUT_OF_STOCK"
+        # Price
+        price = None
+        match = re.search(r"₹\s?([\d,]+)", page_text)
+        if match:
+            price = int(match.group(1).replace(",", ""))
 
-        if "add to cart" in page_text:
-            return "IN_STOCK"
-
-        if "buy now" in page_text:
-            return "IN_STOCK"
-
-        if "see all buying options" in page_text:
-            return "IN_STOCK"
-
-        if "1 option from" in page_text:
-            return "IN_STOCK"
-
-        return "OUT_OF_STOCK"
+        return {"stock": stock, "price": price}
 
 # ================= BOT COMMANDS =================
 
@@ -220,35 +200,70 @@ def start(update: Update, context: CallbackContext):
 def add(update: Update, context: CallbackContext):
     update.message.reply_text("Send Amazon product link.")
 
+def handle_message(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    db.add_user(user_id, update.effective_chat.id)
+
+    asin = AmazonScraper.extract_asin(update.message.text)
+    if not asin:
+        update.message.reply_text("❌ Invalid Amazon link.")
+        return
+
+    url = f"https://www.amazon.in/dp/{asin}"
+    update.message.reply_text("🔍 Fetching product details...")
+
+    title = f"Product {asin}"
+    data = AmazonScraper.fetch_product_data(url)
+
+    stock = data["stock"]
+    price = data["price"]
+
+    db.add_product(user_id, asin, title, url)
+
+    emoji = "🟢" if stock == "IN_STOCK" else "🔴"
+    status_text = "In Stock" if stock == "IN_STOCK" else "Out of Stock"
+    price_text = f"₹{price:,}" if price else "N/A"
+
+    message = (
+        "━━━━━━━━━━━━━━\n"
+        "✅ *PRODUCT ADDED*\n\n"
+        f"{emoji} `{status_text}`\n"
+        f"💰 *{price_text}*\n\n"
+        f"🔗 [View on Amazon]({url})\n"
+        "━━━━━━━━━━━━━━"
+    )
+
+    update.message.reply_text(
+        message,
+        parse_mode=ParseMode.MARKDOWN,
+        disable_web_page_preview=True
+    )
+
 def status_check(update: Update, context: CallbackContext):
     user_id = update.effective_user.id
     products = db.get_products(user_id)
 
     if not products:
-        update.message.reply_text("No products added.")
+        update.message.reply_text("📭 No products added.")
         return
 
     msg = "📊 *STOCK STATUS*\n\n"
 
     for index, p in enumerate(products, 1):
-        stock = AmazonScraper.check_stock(p["url"])
 
-        if stock == "IN_STOCK":
-            emoji = "🟢"
-            status_text = "In Stock"
-        else:
-            emoji = "🟠"
-            status_text = "Out of Stock"
+        data = AmazonScraper.fetch_product_data(p["url"])
+        stock = data["stock"]
+        price = data["price"]
 
-        title = p["title"]
-        if len(title) > 60:
-            title = title[:60] + "..."
+        emoji = "🟢" if stock == "IN_STOCK" else "🔴"
+        status_text = "In Stock" if stock == "IN_STOCK" else "Out of Stock"
+        price_text = f"₹{price:,}" if price else "N/A"
 
         msg += (
-            f"{index}. 📦 *{title}*\n"
-            f"{emoji} `{status_text}`\n"
+            f"{index}. {emoji} `{status_text}`\n"
+            f"💰 *{price_text}*\n"
             f"🔗 [View Product]({p['url']})\n\n"
-            f"──────────────\n\n"
+            "━━━━━━━━━━━━━━\n\n"
         )
 
         db.update_product_status(p['id'], stock)
@@ -260,21 +275,30 @@ def status_check(update: Update, context: CallbackContext):
         disable_web_page_preview=True
     )
 
-def handle_message(update: Update, context: CallbackContext):
-    user_id = update.effective_user.id
-    db.add_user(user_id, update.effective_chat.id)
+# ================= 1-MIN AUTO CHECK =================
 
-    asin = AmazonScraper.extract_asin(update.message.text)
-    if not asin:
-        update.message.reply_text("Invalid Amazon link.")
+def scheduled_stock_check(context: CallbackContext):
+    logger.info("⏱ Running stock check...")
+
+    products = db.get_all_products_with_users()
+    if not products:
         return
 
-    url = f"https://www.amazon.in/dp/{asin}"
-    title = AmazonScraper.fetch_title(url, asin)
+    random.shuffle(products)
 
-    db.add_product(user_id, asin, title, url)
+    for product in products:
+        data = AmazonScraper.fetch_product_data(product["url"])
+        new_status = data["stock"]
+        old_status = product.get("last_status", "OUT_OF_STOCK")
 
-    update.message.reply_text(f"Product added:\n{title}")
+        if old_status == "OUT_OF_STOCK" and new_status == "IN_STOCK":
+            context.bot.send_message(
+                chat_id=product["chat_id"],
+                text=f"🔥 BACK IN STOCK!\n\n🔗 {product['url']}"
+            )
+
+        db.update_product_status(product["id"], new_status)
+        time.sleep(2)
 
 # ================= HEALTH SERVER =================
 
@@ -299,6 +323,8 @@ def main():
     dp.add_handler(CommandHandler("add", add))
     dp.add_handler(CommandHandler("status", status_check))
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
+
+    updater.job_queue.run_repeating(scheduled_stock_check, interval=60, first=30)
 
     updater.start_polling()
     updater.idle()
