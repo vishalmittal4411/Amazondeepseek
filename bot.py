@@ -9,8 +9,10 @@ from bs4 import BeautifulSoup
 from psycopg2 import pool
 from psycopg2.extras import DictCursor
 from telegram import Update, ParseMode, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext, CallbackQueryHandler
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext, CallbackQueryHandler, JobQueue
 from telegram.error import TelegramError, NetworkError, Conflict, TimedOut
+from flask import Flask, request
+import threading
 import os
 import sys
 
@@ -18,7 +20,7 @@ import sys
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 PORT = int(os.environ.get("PORT", 8080))
-RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")  # e.g., https://yourapp.onrender.com
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")  # Render ka public URL
 
 if not BOT_TOKEN:
     print("❌ BOT_TOKEN environment variable not set!")
@@ -38,14 +40,6 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
-
-# Global exception handler
-def handle_exception(exc_type, exc_value, exc_traceback):
-    if issubclass(exc_type, KeyboardInterrupt):
-        sys.__excepthook__(exc_type, exc_value, exc_traceback)
-        return
-    logger.critical("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
-sys.excepthook = handle_exception
 
 # ================= DATABASE (unchanged) =================
 class DatabaseManager:
@@ -397,13 +391,14 @@ class AmazonScraper:
 # ================= BOT LOGIC =================
 db = DatabaseManager()
 
+# Stock check job ke liye lock (overlapping se bachne ke liye)
 stock_check_lock = Lock()
 
 def error_handler(update: Update, context: CallbackContext):
     try:
         raise context.error
     except Conflict:
-        logger.warning("⚠️ Conflict error - webhook mode, ignoring.")
+        logger.warning("⚠️ Conflict error - but we are using webhook, so this shouldn't happen. Ignoring.")
         time.sleep(2)
     except (NetworkError, TimedOut):
         logger.warning("⚠️ Network error - 5 sec sleep")
@@ -419,6 +414,7 @@ def start(update: Update, context: CallbackContext):
         update.message.reply_text(
             "*✅ Amazon Tracker v2.0*\n\n"
             "➕ /add – Add a product\n"
+            "📋 /list – Your products\n"
             "📊 /status – Check stock & price\n"
             "🗑 /remove – Remove a product\n\n"
             "💰 *Price drop alerts* (5%+)\n"
@@ -429,86 +425,74 @@ def start(update: Update, context: CallbackContext):
         logger.error(f"Start error: {e}")
         update.message.reply_text("❌ Error occurred. Please try again.")
 
-def status_check(update: Update, context: CallbackContext):
+def list_products(update: Update, context: CallbackContext):
     user_id = update.effective_user.id
-    products = db.get_products(user_id)
-    if not products:
-        update.message.reply_text("📭 *No products added*", parse_mode=ParseMode.MARKDOWN)
-        return
-
-    # Immediate acknowledgment
-    msg = update.message.reply_text(
-        "⏳ *Checking your products...*\nThis may take a few seconds.",
-        parse_mode=ParseMode.MARKDOWN
-    )
-
-    # Run the actual check in background using job_queue
-    context.job_queue.run_once(
-        lambda ctx: perform_status_check(ctx, user_id, msg.chat_id, msg.message_id),
-        0
-    )
-
-def perform_status_check(context: CallbackContext, user_id, chat_id, status_msg_id):
     try:
         products = db.get_products(user_id)
-        response = "*📊 Stock & Price Status*\n\n"
-        product_count = len(products)
 
-        for idx, p in enumerate(products, start=1):
-            try:
-                info = AmazonScraper.fetch_product_info(p['asin'])
-                stock = info['status']
-                price = info['price']
-                
-                old_price = db.update_product_price(p['id'], price)
-                db.update_product_status(p['id'], stock)
-                
-                if stock == "IN_STOCK":
-                    status_text = "🟢 IN STOCK"
-                    price_display = f"₹{price:,.0f}" if price else "N/A"
-                elif stock == "OUT_OF_STOCK":
-                    status_text = "🔴 OUT OF STOCK"
-                    price_display = "N/A"
-                else:
-                    status_text = "⚪ UNKNOWN"
-                    price_display = "N/A"
-                
-                trend = ""
-                if old_price > 0 and price > 0:
-                    if price < old_price:
-                        drop = ((old_price - price) / old_price) * 100
-                        trend = f" 📉 ({drop:.1f}%)"
-                    elif price > old_price:
-                        rise = ((price - old_price) / old_price) * 100
-                        trend = f" 📈 ({rise:.1f}%)"
-                
-                short_title = (p['title'][:40] + "…") if len(p['title']) > 40 else p['title']
-                response += f"{idx}. [{short_title}]({p['url']}) – {status_text} · {price_display}{trend}\n\n"
+        if not products:
+            update.message.reply_text("📭 *No products added*", parse_mode=ParseMode.MARKDOWN)
+            return
 
-                # Throttle only if many products
-                if product_count > 10 and idx % 10 == 0:
-                    time.sleep(1)
-            except Exception as e:
-                logger.error(f"Error processing product {p['asin']}: {e}")
-                response += f"{idx}. *Error fetching product*\n\n"
+        msg = "*📋 Your Products*\n\n"
+        for i, p in enumerate(products, 1):
+            status_emoji = "🟢" if p.get('last_status') == 'IN_STOCK' else "🔴"
+            price = f"₹{p['current_price']:,.0f}" if p.get('current_price') and p['current_price'] > 0 else "N/A"
+            short_title = (p['title'][:40] + "…") if len(p['title']) > 40 else p['title']
+            msg += f"{i}. {status_emoji} *{short_title}*\n   💰 {price}\n\n"
 
-        context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=status_msg_id,
-            text=response,
-            parse_mode=ParseMode.MARKDOWN,
-            disable_web_page_preview=True
-        )
+        update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
-        logger.error(f"Background status error: {e}")
-        try:
-            context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=status_msg_id,
-                text="❌ Error checking status. Please try again later."
-            )
-        except:
-            pass
+        logger.error(f"List error: {e}")
+        update.message.reply_text("❌ Error fetching list")
+
+def status_check(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    try:
+        products = db.get_products(user_id)
+
+        if not products:
+            update.message.reply_text("📭 *No products added*", parse_mode=ParseMode.MARKDOWN)
+            return
+
+        msg = "*📊 Stock & Price Status*\n\n"
+        
+        for idx, p in enumerate(products, start=1):
+            info = AmazonScraper.fetch_product_info(p['asin'])
+            stock = info['status']
+            price = info['price']
+            
+            old_price = db.update_product_price(p['id'], price)
+            db.update_product_status(p['id'], stock)
+            
+            if stock == "IN_STOCK":
+                status_text = "🟢 IN STOCK"
+                price_display = f"₹{price:,.0f}" if price else "N/A"
+            elif stock == "OUT_OF_STOCK":
+                status_text = "🔴 OUT OF STOCK"
+                price_display = "N/A"
+            else:
+                status_text = "⚪ UNKNOWN"
+                price_display = "N/A"
+            
+            trend = ""
+            if old_price > 0 and price > 0:
+                if price < old_price:
+                    drop = ((old_price - price) / old_price) * 100
+                    trend = f" 📉 ({drop:.1f}%)"
+                elif price > old_price:
+                    rise = ((price - old_price) / old_price) * 100
+                    trend = f" 📈 ({rise:.1f}%)"
+            
+            short_title = (p['title'][:40] + "…") if len(p['title']) > 40 else p['title']
+            msg += f"{idx}. [{short_title}]({p['url']}) – {status_text} · {price_display}{trend}\n\n"
+            
+            time.sleep(2)
+
+        update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+    except Exception as e:
+        logger.error(f"Status error: {e}")
+        update.message.reply_text("❌ Error checking status")
 
 def add(update: Update, context: CallbackContext):
     update.message.reply_text(
@@ -628,141 +612,172 @@ def handle_remove_number(update: Update, context: CallbackContext):
 
 # ================= STOCK CHECKER FUNCTION =================
 def scheduled_stock_check(context: CallbackContext):
+    """🔄 Check every 2 minutes (non-overlapping)"""
+    # Lock to prevent overlapping runs
     if not stock_check_lock.acquire(blocking=False):
         logger.warning("⚠️ Previous stock check still running, skipping this run.")
         return
 
     try:
         logger.info("🔄 Running stock check (every 2 mins)...")
+        
         products = db.get_all_products_with_users()
+        
         if not products:
             logger.info("No products to check")
             return
+            
+        logger.info(f"Checking {len(products)} products")
         
-        total = len(products)
-        logger.info(f"Checking {total} products")
-        
-        # Process in batches of 5
-        batch_size = 5
-        for i in range(0, total, batch_size):
-            batch = products[i:i+batch_size]
-            for product in batch:
-                try:
-                    old_status = product.get('last_status', 'UNKNOWN')
-                    old_price = product.get('current_price', 0)
+        for product in products:
+            try:
+                old_status = product.get('last_status', 'UNKNOWN')
+                old_price = product.get('current_price', 0)
+                
+                info = AmazonScraper.fetch_product_info(product['asin'])
+                new_status = info['status']
+                new_price = info['price']
+                
+                db.update_product_status(product['id'], new_status)
+                
+                if new_status == 'IN_STOCK' and new_price > 0:
+                    old_price = db.update_product_price(product['id'], new_price)
                     
-                    info = AmazonScraper.fetch_product_info(product['asin'])
-                    new_status = info['status']
-                    new_price = info['price']
-                    
-                    db.update_product_status(product['id'], new_status)
-                    
-                    if new_status == 'IN_STOCK' and new_price > 0:
-                        old_price = db.update_product_price(product['id'], new_price)
-                        
-                        if old_price > 0 and new_price < old_price:
-                            drop_percent = ((old_price - new_price) / old_price) * 100
-                            if drop_percent >= 5:
-                                logger.info(f"💰 PRICE DROP: {product['asin']} - {drop_percent:.1f}%")
-                                context.bot.send_message(
-                                    chat_id=product['chat_id'],
-                                    text=(
-                                        f"💰 *Price Drop!*\n\n"
-                                        f"📦 *{product['title'][:100]}*\n"
-                                        f"~~₹{old_price:,.0f}~~ → *₹{new_price:,.0f}* (▼ {drop_percent:.1f}%)\n\n"
-                                        f"[🔗 View on Amazon]({product['url']})"
-                                    ),
-                                    parse_mode=ParseMode.MARKDOWN
-                                )
-                    
-                    if old_status != new_status:
-                        if old_status == 'OUT_OF_STOCK' and new_status == 'IN_STOCK':
-                            logger.info(f"🔥 STOCK ALERT: {product['asin']} back in stock!")
-                            for i in range(10):
-                                price_info = f"\n💰 ₹{new_price:,.0f}" if new_price else ""
-                                context.bot.send_message(
-                                    chat_id=product['chat_id'],
-                                    text=(
-                                        f"🔥 *Back in Stock!* ({i+1}/10)\n\n"
-                                        f"📦 *{product['title'][:100]}*{price_info}\n\n"
-                                        f"[🔗 View on Amazon]({product['url']})"
-                                    ),
-                                    parse_mode=ParseMode.MARKDOWN
-                                )
-                                if i < 9:
-                                    time.sleep(2)
-                        
-                        elif old_status == 'IN_STOCK' and new_status == 'OUT_OF_STOCK':
-                            logger.info(f"📉 OUT OF STOCK: {product['asin']}")
+                    if old_price > 0 and new_price < old_price:
+                        drop_percent = ((old_price - new_price) / old_price) * 100
+                        if drop_percent >= 5:
+                            logger.info(f"💰 PRICE DROP: {product['asin']} - {drop_percent:.1f}%")
                             context.bot.send_message(
                                 chat_id=product['chat_id'],
                                 text=(
-                                    f"📉 *Out of Stock*\n\n"
-                                    f"📦 *{product['title'][:100]}*\n\n"
+                                    f"💰 *Price Drop!*\n\n"
+                                    f"📦 *{product['title'][:100]}*\n"
+                                    f"~~₹{old_price:,.0f}~~ → *₹{new_price:,.0f}* (▼ {drop_percent:.1f}%)\n\n"
                                     f"[🔗 View on Amazon]({product['url']})"
                                 ),
                                 parse_mode=ParseMode.MARKDOWN
                             )
+                
+                if old_status != new_status:
+                    if old_status == 'OUT_OF_STOCK' and new_status == 'IN_STOCK':
+                        logger.info(f"🔥 STOCK ALERT: {product['asin']} back in stock!")
+                        for i in range(10):
+                            price_info = f"\n💰 ₹{new_price:,.0f}" if new_price else ""
+                            context.bot.send_message(
+                                chat_id=product['chat_id'],
+                                text=(
+                                    f"🔥 *Back in Stock!* ({i+1}/10)\n\n"
+                                    f"📦 *{product['title'][:100]}*{price_info}\n\n"
+                                    f"[🔗 View on Amazon]({product['url']})"
+                                ),
+                                parse_mode=ParseMode.MARKDOWN
+                            )
+                            if i < 9:
+                                time.sleep(2)
                     
-                except Exception as e:
-                    logger.error(f"Error checking product {product.get('asin', 'unknown')}: {e}")
-                    continue
-            
-            # Delay between batches
-            if i + batch_size < total:
-                time.sleep(2)
+                    elif old_status == 'IN_STOCK' and new_status == 'OUT_OF_STOCK':
+                        logger.info(f"📉 OUT OF STOCK: {product['asin']}")
+                        context.bot.send_message(
+                            chat_id=product['chat_id'],
+                            text=(
+                                f"📉 *Out of Stock*\n\n"
+                                f"📦 *{product['title'][:100]}*\n\n"
+                                f"[🔗 View on Amazon]({product['url']})"
+                            ),
+                            parse_mode=ParseMode.MARKDOWN
+                        )
+                
+                time.sleep(random.randint(5, 10))
+                
+            except Exception as e:
+                logger.error(f"Error checking product {product.get('asin', 'unknown')}: {e}")
+                continue
                 
     except Exception as e:
         logger.error(f"Stock check error: {e}")
     finally:
         stock_check_lock.release()
 
+# ================= FLASK APP FOR WEBHOOK =================
+health_app = Flask(__name__)
+
+# Webhook endpoint
+@health_app.route('/webhook', methods=['POST'])
+def webhook():
+    """Telegram webhook endpoint"""
+    update = Update.de_json(request.get_json(force=True), updater.bot)
+    dispatcher.process_update(update)
+    return "OK", 200
+
+@health_app.route('/')
+def home():
+    return "🤖 Amazon Bot v2.0 Running (Webhook)", 200
+
+@health_app.route('/health')
+def health():
+    return "OK", 200
+
+def run_health_server():
+    health_app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
+
 # ================= MAIN =================
 def main():
     logger.info("=" * 60)
-    logger.info("🔥 AMAZON TRACKER v2.0 (Built-in Webhook - Fixed Port)")
+    logger.info("🔥 AMAZON TRACKER v2.0 (Webhook Mode)")
     logger.info("✅ Price tracking + Drop alerts")
     logger.info("✅ 2-minute checks (non-overlapping)")
     logger.info("=" * 60)
+    
+    health_thread = threading.Thread(target=run_health_server, daemon=True)
+    health_thread.start()
+    logger.info(f"✅ Health server on port {PORT}")
     
     try:
         db.create_tables()
         logger.info("✅ Database ready")
     except Exception as e:
         logger.critical(f"Database error: {e}")
+        time.sleep(5)
+        main()
+        return
+    
+    global updater, dispatcher
+    updater = Updater(token=BOT_TOKEN, use_context=True)
+    dispatcher = updater.dispatcher
+    
+    # Set webhook
+    webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
+    try:
+        updater.bot.set_webhook(url=webhook_url)
+        logger.info(f"✅ Webhook set to {webhook_url}")
+    except Exception as e:
+        logger.error(f"Failed to set webhook: {e}")
         sys.exit(1)
     
-    updater = Updater(token=BOT_TOKEN, use_context=True)
-    dp = updater.dispatcher
-    
     # Add handlers
+    dp = dispatcher
     dp.add_handler(CommandHandler("start", start))
     dp.add_handler(CommandHandler("add", add))
+    dp.add_handler(CommandHandler("list", list_products))
     dp.add_handler(CommandHandler("status", status_check))
     dp.add_handler(CommandHandler("remove", remove))
     dp.add_handler(CallbackQueryHandler(remove_callback, pattern=r'^remove_'))
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
     dp.add_error_handler(error_handler)
     
-    # 🔥 2 MINUTE CHECKS
+    # 🔥 2 MINUTE CHECKS (non-overlapping)
     job_queue = updater.job_queue
     job_queue.run_repeating(scheduled_stock_check, interval=120, first=10)
     logger.info("✅ Stock checker (every 2 minutes)")
     
-    # Webhook URL (without port)
-    webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
+    # Start Flask webhook server (already running in thread)
+    # No polling needed
     
-    # Start webhook server (this automatically sets the webhook)
-    updater.start_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path="webhook",
-        webhook_url=webhook_url  # ✅ Important: pass the full public URL
-    )
-    logger.info(f"✅ Webhook server listening on port {PORT} with URL {webhook_url}")
+    logger.info("✅ Bot v2.0 running with webhook!")
     
-    # Block until stopped
-    updater.idle()
+    # Keep main thread alive (Flask is in daemon, so we need to block)
+    while True:
+        time.sleep(10)
 
 if __name__ == "__main__":
     main()
