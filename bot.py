@@ -364,7 +364,6 @@ def list_products(update: Update, context: CallbackContext):
         update.message.reply_text("❌ Error fetching list.")
 
 def status_check(update: Update, context: CallbackContext):
-    """Products ki stock status check karo with clickable links"""
     user_id = update.effective_user.id
     try:
         products = db.get_products(user_id)
@@ -377,15 +376,13 @@ def status_check(update: Update, context: CallbackContext):
         for p in products:
             stock = AmazonScraper.check_stock(p["url"])
             emoji = "🟢" if stock == "IN_STOCK" else "🔴" if stock == "OUT_OF_STOCK" else "⚪"
-            
-            # 🔥 Chota clickable link - sirf "🔗 Link" dikhega
-            msg += f"{emoji} {p['title'][:50]}... [🔗 Link]({p['url']}) - `{stock}`\n"
+            msg += f"{emoji} {p['title'][:50]}... - `{stock}`\n"
             
             # Update status in database
             db.update_product_status(p['id'], stock)
             time.sleep(2)
 
-        update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+        update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         logger.error(f"Status error: {e}")
         update.message.reply_text("❌ Error checking status.")
@@ -524,8 +521,7 @@ def scheduled_stock_check(context: CallbackContext):
                         text=(
                             f"📊 *Status Updated*\n\n"
                             f"📦 *{product['title']}*\n\n"
-                            f"Status: {emoji} {new_status}\n\n"
-                            f"🔗 [View on Amazon]({product['url']})"
+                            f"Status: {emoji} {new_status}"
                         ),
                         parse_mode=ParseMode.MARKDOWN
                     )
