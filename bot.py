@@ -9,7 +9,7 @@ from bs4 import BeautifulSoup
 from psycopg2 import pool
 from psycopg2.extras import DictCursor
 from telegram import Update, ParseMode, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext, CallbackQueryHandler, JobQueue
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext, CallbackQueryHandler
 from telegram.error import TelegramError, NetworkError, Conflict, TimedOut
 import os
 import sys
@@ -39,7 +39,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Global exception handler to log uncaught exceptions
+# Global exception handler
 def handle_exception(exc_type, exc_value, exc_traceback):
     if issubclass(exc_type, KeyboardInterrupt):
         sys.__excepthook__(exc_type, exc_value, exc_traceback)
@@ -485,7 +485,7 @@ def perform_status_check(context: CallbackContext, user_id, chat_id, status_msg_
                 short_title = (p['title'][:40] + "…") if len(p['title']) > 40 else p['title']
                 response += f"{idx}. [{short_title}]({p['url']}) – {status_text} · {price_display}{trend}\n\n"
 
-                # Throttle only if many products (to avoid hitting Amazon too hard)
+                # Throttle only if many products
                 if product_count > 10 and idx % 10 == 0:
                     time.sleep(1)
             except Exception as e:
@@ -563,7 +563,6 @@ def remove_callback(update: Update, context: CallbackContext):
 
 def handle_message(update: Update, context: CallbackContext):
     try:
-        # If user is in removal process (legacy, but keeping for safety)
         if "remove_list" in context.user_data:
             handle_remove_number(update, context)
             return
@@ -709,7 +708,7 @@ def scheduled_stock_check(context: CallbackContext):
                     logger.error(f"Error checking product {product.get('asin', 'unknown')}: {e}")
                     continue
             
-            # Delay between batches to avoid hitting Amazon too hard
+            # Delay between batches
             if i + batch_size < total:
                 time.sleep(2)
                 
@@ -721,7 +720,7 @@ def scheduled_stock_check(context: CallbackContext):
 # ================= MAIN =================
 def main():
     logger.info("=" * 60)
-    logger.info("🔥 AMAZON TRACKER v2.0 (Built-in Webhook)")
+    logger.info("🔥 AMAZON TRACKER v2.0 (Built-in Webhook - Fixed Port)")
     logger.info("✅ Price tracking + Drop alerts")
     logger.info("✅ 2-minute checks (non-overlapping)")
     logger.info("=" * 60)
@@ -750,22 +749,17 @@ def main():
     job_queue.run_repeating(scheduled_stock_check, interval=120, first=10)
     logger.info("✅ Stock checker (every 2 minutes)")
     
-    # Set webhook
+    # Webhook URL (without port)
     webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
-    try:
-        updater.bot.set_webhook(url=webhook_url)
-        logger.info(f"✅ Webhook set to {webhook_url}")
-    except Exception as e:
-        logger.error(f"Failed to set webhook: {e}")
-        sys.exit(1)
     
-    # Start webhook server (built-in)
+    # Start webhook server (this automatically sets the webhook)
     updater.start_webhook(
         listen="0.0.0.0",
         port=PORT,
-        url_path="webhook"
+        url_path="webhook",
+        webhook_url=webhook_url  # ✅ Important: pass the full public URL
     )
-    logger.info(f"✅ Webhook server listening on port {PORT}")
+    logger.info(f"✅ Webhook server listening on port {PORT} with URL {webhook_url}")
     
     # Block until stopped
     updater.idle()
