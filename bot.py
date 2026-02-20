@@ -1,6 +1,5 @@
 import logging
 import re
-import html
 import requests
 import time
 import random
@@ -10,7 +9,6 @@ from psycopg2 import pool
 from psycopg2.extras import DictCursor
 from telegram import Update, ParseMode
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
-from telegram.error import TelegramError
 from flask import Flask
 import threading
 import os
@@ -23,7 +21,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 PORT = int(os.environ.get("PORT", 8080))
 
 if not BOT_TOKEN or not DATABASE_URL:
-    print("Environment variables missing!")
+    print("Missing environment variables")
     sys.exit(1)
 
 logging.basicConfig(level=logging.INFO)
@@ -121,13 +119,13 @@ class DatabaseManager:
 
 db = DatabaseManager()
 
-# ================= AMAZON SCRAPER =================
+# ================= SCRAPER =================
 
 class AmazonScraper:
 
     USER_AGENTS = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
     ]
 
     @staticmethod
@@ -162,12 +160,18 @@ class AmazonScraper:
     def fetch_product_data(url):
         html_text = AmazonScraper.fetch_page(url)
         if not html_text:
-            return {"stock": "OUT_OF_STOCK", "price": None}
+            return {"stock": "OUT_OF_STOCK", "price": None, "title": None}
 
         soup = BeautifulSoup(html_text, "lxml")
         page_text = soup.get_text(" ").lower()
 
-        # Stock
+        # TITLE
+        title = None
+        title_tag = soup.find(id="productTitle")
+        if title_tag:
+            title = title_tag.get_text(strip=True)
+
+        # STOCK
         if "currently unavailable" in page_text or "out of stock" in page_text:
             stock = "OUT_OF_STOCK"
         elif ("add to cart" in page_text
@@ -178,15 +182,17 @@ class AmazonScraper:
         else:
             stock = "OUT_OF_STOCK"
 
-        # Price
+        # PRICE
         price = None
-        match = re.search(r"₹\s?([\d,]+)", page_text)
-        if match:
-            price = int(match.group(1).replace(",", ""))
+        price_container = soup.find("span", class_="a-price-whole")
+        if price_container:
+            whole = price_container.get_text().replace(",", "")
+            if whole.isdigit():
+                price = int(whole)
 
-        return {"stock": stock, "price": price}
+        return {"stock": stock, "price": price, "title": title}
 
-# ================= BOT COMMANDS =================
+# ================= BOT =================
 
 def start(update: Update, context: CallbackContext):
     db.add_user(update.effective_user.id, update.effective_chat.id)
@@ -212,9 +218,9 @@ def handle_message(update: Update, context: CallbackContext):
     url = f"https://www.amazon.in/dp/{asin}"
     update.message.reply_text("🔍 Fetching product details...")
 
-    title = f"Product {asin}"
     data = AmazonScraper.fetch_product_data(url)
 
+    title = data["title"] if data["title"] else f"Product {asin}"
     stock = data["stock"]
     price = data["price"]
 
@@ -222,11 +228,16 @@ def handle_message(update: Update, context: CallbackContext):
 
     emoji = "🟢" if stock == "IN_STOCK" else "🔴"
     status_text = "In Stock" if stock == "IN_STOCK" else "Out of Stock"
-    price_text = f"₹{price:,}" if price else "N/A"
+
+    if stock == "IN_STOCK" and price:
+        price_text = f"₹{price:,}"
+    else:
+        price_text = "N/A"
 
     message = (
         "━━━━━━━━━━━━━━\n"
         "✅ *PRODUCT ADDED*\n\n"
+        f"📦 *{title[:70]}*\n\n"
         f"{emoji} `{status_text}`\n"
         f"💰 *{price_text}*\n\n"
         f"🔗 [View on Amazon]({url})\n"
@@ -257,10 +268,19 @@ def status_check(update: Update, context: CallbackContext):
 
         emoji = "🟢" if stock == "IN_STOCK" else "🔴"
         status_text = "In Stock" if stock == "IN_STOCK" else "Out of Stock"
-        price_text = f"₹{price:,}" if price else "N/A"
+
+        if stock == "IN_STOCK" and price:
+            price_text = f"₹{price:,}"
+        else:
+            price_text = "N/A"
+
+        title = p["title"]
+        if len(title) > 60:
+            title = title[:60] + "..."
 
         msg += (
-            f"{index}. {emoji} `{status_text}`\n"
+            f"{index}. 📦 *{title}*\n"
+            f"{emoji} `{status_text}`\n"
             f"💰 *{price_text}*\n"
             f"🔗 [View Product]({p['url']})\n\n"
             "━━━━━━━━━━━━━━\n\n"
@@ -275,16 +295,10 @@ def status_check(update: Update, context: CallbackContext):
         disable_web_page_preview=True
     )
 
-# ================= 1-MIN AUTO CHECK =================
-
 def scheduled_stock_check(context: CallbackContext):
-    logger.info("⏱ Running stock check...")
-
     products = db.get_all_products_with_users()
     if not products:
         return
-
-    random.shuffle(products)
 
     for product in products:
         data = AmazonScraper.fetch_product_data(product["url"])
@@ -300,22 +314,9 @@ def scheduled_stock_check(context: CallbackContext):
         db.update_product_status(product["id"], new_status)
         time.sleep(2)
 
-# ================= HEALTH SERVER =================
-
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return "Bot running", 200
-
-def run_health():
-    app.run(host="0.0.0.0", port=PORT)
-
 # ================= MAIN =================
 
 def main():
-    threading.Thread(target=run_health, daemon=True).start()
-
     updater = Updater(BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
 
