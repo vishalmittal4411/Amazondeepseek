@@ -145,7 +145,7 @@
 ‎            
 ‎            if not result:
 ‎                logger.info("Adding last_status column to products table...")
-‎                self.execute("ALTER TABLE products ADD COLUMN last_status VARCHAR(20) DEFAULT 'OUT_OF_STOCK';")
+‎                self.execute("ALTER TABLE products ADD COLUMN last_status VARCHAR(20) DEFAULT 'UNKNOWN';")
 ‎            
 ‎            # Check if last_checked column exists
 ‎            result = self.execute("""
@@ -173,7 +173,7 @@
 ‎    def add_product(self, user_id, asin, title, url):
 ‎        self.execute("""
 ‎        INSERT INTO products (user_id, asin, title, url, last_status)
-‎        VALUES (%s, %s, %s, %s, 'OUT_OF_STOCK')
+‎        VALUES (%s, %s, %s, %s, 'UNKNOWN')
 ‎        ON CONFLICT (user_id, asin)
 ‎        DO UPDATE SET title = EXCLUDED.title, url = EXCLUDED.url
 ‎        """, (user_id, asin, title, url))
@@ -279,37 +279,29 @@
 ‎
 ‎    @staticmethod
 ‎    def check_stock(url):
-‎        """Sirf IN_STOCK aur OUT_OF_STOCK return karega"""
 ‎        html_text = AmazonScraper.fetch_page(url)
 ‎        if not html_text:
-‎            # Agar page load nahi hua to OUT_OF_STOCK
-‎            return "OUT_OF_STOCK"
+‎            return "UNKNOWN"
 ‎
 ‎        try:
 ‎            soup = BeautifulSoup(html_text, "lxml")
-‎            
-‎            # Check for IN_STOCK indicators
-‎            if soup.find(id="add-to-cart-button"):
-‎                return "IN_STOCK"
-‎            
-‎            if soup.find(id="buy-now-button"):
-‎                return "IN_STOCK"
-‎            
-‎            # Check page text for buying options
 ‎            page_text = soup.get_text(" ").lower()
-‎            if "see all buying options" in page_text:
-‎                return "IN_STOCK"
-‎            
-‎            # Check for out of stock indicators
+‎
 ‎            if "currently unavailable" in page_text or "out of stock" in page_text:
 ‎                return "OUT_OF_STOCK"
-‎            
-‎            # Agar kuch bhi match nahi hua to OUT_OF_STOCK
-‎            return "OUT_OF_STOCK"
-‎            
-‎        except Exception as e:
-‎            logger.error(f"Error checking stock: {e}")
-‎            return "OUT_OF_STOCK"
+‎
+‎            if soup.find(id="add-to-cart-button"):
+‎                return "IN_STOCK"
+‎
+‎            if soup.find(id="buy-now-button"):
+‎                return "IN_STOCK"
+‎
+‎            if "see all buying options" in page_text:
+‎                return "IN_STOCK"
+‎        except:
+‎            pass
+‎
+‎        return "UNKNOWN"
 ‎
 ‎    @staticmethod
 ‎    def fetch_product_info(asin):
@@ -339,15 +331,15 @@
 ‎def start(update: Update, context: CallbackContext):
 ‎    try:
 ‎        db.add_user(update.effective_user.id, update.effective_chat.id)
-‎        
-‎        msg = "✅ *Bot Activated*\n\n"
-‎        msg += "Commands:\n"
-‎        msg += "/add ➕ Add product\n"
-‎        msg += "/list 📋 Show products\n"
-‎        msg += "/status 📊 Check stock\n"
-‎        msg += "/remove 🗑 Remove product\n"
-‎        
-‎        update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+‎        update.message.reply_text(
+‎            "✅ *Bot Activated*\n\n"
+‎            "Commands:\n"
+‎            "/add ➕ Add product\n"
+‎            "/list 📋 Show products\n"
+‎            "/status 📊 Check stock\n"
+‎            "/remove 🗑 Remove product",
+‎            parse_mode=ParseMode.MARKDOWN
+‎        )
 ‎    except Exception as e:
 ‎        logger.error(f"Start error: {e}")
 ‎        update.message.reply_text("❌ Error occurred. Please try again.")
@@ -363,7 +355,7 @@
 ‎
 ‎        msg = "📋 *Your Products:*\n\n"
 ‎        for i, p in enumerate(products, 1):
-‎            status_emoji = "🟢" if p.get('last_status') == 'IN_STOCK' else "🔴"
+‎            status_emoji = "🟢" if p.get('last_status') == 'IN_STOCK' else "🔴" if p.get('last_status') == 'OUT_OF_STOCK' else "⚪"
 ‎            msg += f"{i}. {status_emoji} {p['title'][:50]}...\n"
 ‎
 ‎        update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
@@ -384,9 +376,9 @@
 ‎        msg = "📊 *Stock Status:*\n\n"
 ‎        for p in products:
 ‎            stock = AmazonScraper.check_stock(p["url"])
-‎            emoji = "🟢" if stock == "IN_STOCK" else "🔴"
+‎            emoji = "🟢" if stock == "IN_STOCK" else "🔴" if stock == "OUT_OF_STOCK" else "⚪"
 ‎            
-‎            # Chota clickable link - sirf "🔗 Link" dikhega
+‎            # 🔥 Chota clickable link - sirf "🔗 Link" dikhega
 ‎            msg += f"{emoji} {p['title'][:50]}... [🔗 Link]({p['url']}) - `{stock}`\n"
 ‎            
 ‎            # Update status in database
@@ -437,7 +429,7 @@
 ‎        info = AmazonScraper.fetch_product_info(asin)
 ‎        db.add_product(user_id, asin, info["title"], info["url"])
 ‎
-‎        emoji = "🟢" if info["status"] == "IN_STOCK" else "🔴"
+‎        emoji = "🟢" if info["status"] == "IN_STOCK" else "🔴" if info["status"] == "OUT_OF_STOCK" else "⚪"
 ‎        update.message.reply_text(
 ‎            f"✅ *Product Added*\n\n"
 ‎            f"📦 {info['title'][:100]}\n\n"
@@ -472,10 +464,9 @@
 ‎        update.message.reply_text("❌ Error removing product.")
 ‎
 ‎# ================= STOCK CHECKER FUNCTION =================
-‎# Sirf IN_STOCK aur OUT_OF_STOCK ke alerts
 ‎
 ‎def scheduled_stock_check(context: CallbackContext):
-‎    """Har 2 minute mein stock check karega"""
+‎    """Har 5 minute mein stock check karega"""
 ‎    logger.info("🔄 Running scheduled stock check...")
 ‎    
 ‎    try:
@@ -489,58 +480,55 @@
 ‎        
 ‎        for product in products:
 ‎            try:
-‎                old_status = product.get('last_status', 'OUT_OF_STOCK')
+‎                old_status = product.get('last_status', 'UNKNOWN')
 ‎                new_status = AmazonScraper.check_stock(product['url'])
 ‎                
 ‎                # Status update karo database mein
 ‎                db.update_product_status(product['id'], new_status)
 ‎                
-‎                # Sirf tab alert jab status actually change hua ho
-‎                if old_status != new_status:
+‎                # Agar OUT_OF_STOCK se IN_STOCK hua to alert bhejo
+‎                if old_status == 'OUT_OF_STOCK' and new_status == 'IN_STOCK':
+‎                    logger.info(f"🔥 STOCK ALERT: {product['asin']} is back in stock!")
 ‎                    
-‎                    # Agar OUT_OF_STOCK se IN_STOCK hua to 10 alerts
-‎                    if old_status == 'OUT_OF_STOCK' and new_status == 'IN_STOCK':
-‎                        logger.info(f"🔥 STOCK ALERT: {product['asin']} is back in stock!")
-‎                        
-‎                        # Pehla alert
+‎                    # User ko alert bhejo
+‎                    context.bot.send_message(
+‎                        chat_id=product['chat_id'],
+‎                        text=(
+‎                            f"🔥 *BACK IN STOCK!*\n\n"
+‎                            f"📦 *{product['title']}*\n\n"
+‎                            f"🔗 [View on Amazon]({product['url']})"
+‎                        ),
+‎                        parse_mode=ParseMode.MARKDOWN
+‎                    )
+‎                    
+‎                    # Extra alerts (10 times)
+‎                    for i in range(9):  # 9 more times (total 10)
+‎                        time.sleep(2)
 ‎                        context.bot.send_message(
 ‎                            chat_id=product['chat_id'],
 ‎                            text=(
-‎                                f"🔥 *BACK IN STOCK!*\n\n"
+‎                                f"🔥 *BACK IN STOCK!* (Alert {i+2}/10)\n\n"
 ‎                                f"📦 *{product['title']}*\n\n"
 ‎                                f"🔗 [View on Amazon]({product['url']})"
 ‎                            ),
 ‎                            parse_mode=ParseMode.MARKDOWN
 ‎                        )
-‎                        
-‎                        # 🔥 Extra alerts (9 more = total 10) - 3 SECOND DELAY
-‎                        for i in range(9):
-‎                            time.sleep(3)  # 3 second delay
-‎                            context.bot.send_message(
-‎                                chat_id=product['chat_id'],
-‎                                text=(
-‎                                    f"🔥 *BACK IN STOCK!* (Alert {i+2}/10)\n\n"
-‎                                    f"📦 *{product['title']}*\n\n"
-‎                                    f"🔗 [View on Amazon]({product['url']})"
-‎                                ),
-‎                                parse_mode=ParseMode.MARKDOWN
-‎                            )
-‎                        
-‎                        logger.info(f"✅ Sent 10 alerts for {product['asin']}")
+‎                
+‎                # Agar status kuch bhi change hua (UNKNOWN se kuch bhi)
+‎                elif old_status != new_status and old_status != 'UNKNOWN':
+‎                    logger.info(f"📊 Status changed: {product['asin']} from {old_status} to {new_status}")
 ‎                    
-‎                    # Agar IN_STOCK se OUT_OF_STOCK hua to 1 alert
-‎                    elif old_status == 'IN_STOCK' and new_status == 'OUT_OF_STOCK':
-‎                        logger.info(f"📉 OUT OF STOCK: {product['asin']}")
-‎                        
-‎                        context.bot.send_message(
-‎                            chat_id=product['chat_id'],
-‎                            text=(
-‎                                f"📉 *OUT OF STOCK*\n\n"
-‎                                f"📦 *{product['title']}*\n\n"
-‎                                f"🔗 [View on Amazon]({product['url']})"
-‎                            ),
-‎                            parse_mode=ParseMode.MARKDOWN
-‎                        )
+‎                    emoji = "🟢" if new_status == "IN_STOCK" else "🔴"
+‎                    context.bot.send_message(
+‎                        chat_id=product['chat_id'],
+‎                        text=(
+‎                            f"📊 *Status Updated*\n\n"
+‎                            f"📦 *{product['title']}*\n\n"
+‎                            f"Status: {emoji} {new_status}\n\n"
+‎                            f"🔗 [View on Amazon]({product['url']})"
+‎                        ),
+‎                        parse_mode=ParseMode.MARKDOWN
+‎                    )
 ‎                
 ‎                # Random delay to avoid Amazon blocking
 ‎                time.sleep(random.randint(5, 10))
@@ -572,8 +560,7 @@
 ‎
 ‎def main():
 ‎    logger.info("=" * 60)
-‎    logger.info("🔥 AMAZON STOCK TRACKER BOT - FINAL VERSION")
-‎    logger.info("✅ IN_STOCK: 10 alerts (3 sec gap) | OUT_OF_STOCK: 1 alert")
+‎    logger.info("🔥 AMAZON STOCK TRACKER BOT - WITH AUTO ALERTS")
 ‎    logger.info("=" * 60)
 ‎    
 ‎    # Health server start karo
@@ -617,9 +604,9 @@
 ‎    # Error handler
 ‎    dp.add_error_handler(error_handler)
 ‎    
-‎    # 🔥 Schedule stock check EVERY 120 SECONDS (2 minutes)
-‎    job_queue.run_repeating(scheduled_stock_check, interval=120, first=10)
-‎    logger.info("✅ Stock checker scheduled (every 120 seconds / 2 minutes)")
+‎    # 🔥 Schedule stock check every 5 minutes (300 seconds)
+‎    job_queue.run_repeating(scheduled_stock_check, interval=300, first=30)
+‎    logger.info("✅ Stock checker scheduled (every 5 minutes)")
 ‎    
 ‎    # Start bot
 ‎    updater.start_polling()
