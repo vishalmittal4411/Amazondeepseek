@@ -11,7 +11,7 @@ from psycopg2.extras import DictCursor
 from telegram import Update, ParseMode, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext, CallbackQueryHandler, JobQueue
 from telegram.error import TelegramError, NetworkError, Conflict, TimedOut
-from flask import Flask
+from flask import Flask, request
 import threading
 import os
 import sys
@@ -20,6 +20,7 @@ import sys
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 PORT = int(os.environ.get("PORT", 8080))
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")  # Render ka public URL
 
 if not BOT_TOKEN:
     print("❌ BOT_TOKEN environment variable not set!")
@@ -29,6 +30,10 @@ if not DATABASE_URL:
     print("❌ DATABASE_URL environment variable not set!")
     sys.exit(1)
 
+if not RENDER_EXTERNAL_URL:
+    print("❌ RENDER_EXTERNAL_URL environment variable not set! (Required for webhook)")
+    sys.exit(1)
+
 # ================= LOGGING =================
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -36,7 +41,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ================= DATABASE =================
+# ================= DATABASE (unchanged) =================
 class DatabaseManager:
     _instance = None
     _lock = Lock()
@@ -133,9 +138,7 @@ class DatabaseManager:
         """)
 
     def add_price_columns(self):
-        """💰 Add price columns for tracking"""
         try:
-            # Check if price columns exist
             result = self.execute("""
                 SELECT column_name 
                 FROM information_schema.columns 
@@ -152,9 +155,7 @@ class DatabaseManager:
             logger.error(f"Error adding price columns: {e}")
 
     def add_missing_columns(self):
-        """Add last_status and last_checked columns if they don't exist"""
         try:
-            # Check if last_status column exists
             result = self.execute("""
                 SELECT column_name 
                 FROM information_schema.columns 
@@ -165,7 +166,6 @@ class DatabaseManager:
                 logger.info("Adding last_status column...")
                 self.execute("ALTER TABLE products ADD COLUMN last_status VARCHAR(20) DEFAULT 'UNKNOWN';")
             
-            # Check if last_checked column exists
             result = self.execute("""
                 SELECT column_name 
                 FROM information_schema.columns 
@@ -197,7 +197,6 @@ class DatabaseManager:
         """, (user_id, asin, title, url))
 
     def update_product_price(self, product_id, new_price):
-        """💰 Update price and return old price"""
         product = self.execute("SELECT current_price FROM products WHERE id = %s", (product_id,), fetch_one=True)
         old_price = product['current_price'] if product else 0
         
@@ -219,7 +218,6 @@ class DatabaseManager:
             return []
 
     def get_all_products_with_users(self):
-        """Sabhi products with user chat_id fetch karo"""
         try:
             return self.execute("""
                 SELECT p.*, u.chat_id 
@@ -232,7 +230,6 @@ class DatabaseManager:
             return []
 
     def update_product_status(self, product_id, status):
-        """Product ka status update karo"""
         self.execute("""
             UPDATE products 
             SET last_status = %s, last_checked = NOW() 
@@ -245,7 +242,7 @@ class DatabaseManager:
             (product_id, user_id)
         )
 
-# ================= AMAZON SCRAPER =================
+# ================= AMAZON SCRAPER (unchanged) =================
 class AmazonScraper:
     
     USER_AGENTS = [
@@ -309,7 +306,6 @@ class AmazonScraper:
 
     @staticmethod
     def extract_price(url, html_text=None):
-        """💰 Extract current price from Amazon page"""
         if not html_text:
             html_text = AmazonScraper.fetch_page(url)
             if not html_text:
@@ -318,7 +314,6 @@ class AmazonScraper:
         try:
             soup = BeautifulSoup(html_text, "lxml")
             
-            # Try different price selectors
             price_selectors = [
                 'span.a-price-whole',
                 'span.a-price span.a-offscreen',
@@ -340,7 +335,6 @@ class AmazonScraper:
                         except:
                             pass
             
-            # Fallback to regex in page text
             page_text = soup.get_text()
             price_patterns = [
                 r'₹\s*([\d,]+(?:\.\d{2})?)',
@@ -397,15 +391,18 @@ class AmazonScraper:
 # ================= BOT LOGIC =================
 db = DatabaseManager()
 
+# Stock check job ke liye lock (overlapping se bachne ke liye)
+stock_check_lock = Lock()
+
 def error_handler(update: Update, context: CallbackContext):
     try:
         raise context.error
     except Conflict:
-        logger.warning("⚠️ Conflict error - 5 sec sleep")
-        time.sleep(5)
+        logger.warning("⚠️ Conflict error - but we are using webhook, so this shouldn't happen. Ignoring.")
+        time.sleep(2)
     except (NetworkError, TimedOut):
-        logger.warning("⚠️ Network error - 10 sec sleep")
-        time.sleep(10)
+        logger.warning("⚠️ Network error - 5 sec sleep")
+        time.sleep(5)
     except TelegramError as e:
         logger.error(f"Telegram error: {e}")
     except Exception as e:
@@ -421,7 +418,7 @@ def start(update: Update, context: CallbackContext):
             "📊 /status – Check stock & price\n"
             "🗑 /remove – Remove a product\n\n"
             "💰 *Price drop alerts* (5%+)\n"
-            "🔄 *Checks every minute*",
+            "🔄 *Checks every 2 minutes*",
             parse_mode=ParseMode.MARKDOWN
         )
     except Exception as e:
@@ -487,11 +484,10 @@ def status_check(update: Update, context: CallbackContext):
                     rise = ((price - old_price) / old_price) * 100
                     trend = f" 📈 ({rise:.1f}%)"
             
-            # Shorten title for mobile view
             short_title = (p['title'][:40] + "…") if len(p['title']) > 40 else p['title']
             msg += f"{idx}. [{short_title}]({p['url']}) – {status_text} · {price_display}{trend}\n\n"
             
-            time.sleep(2)  # Be gentle to Amazon
+            time.sleep(2)
 
         update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
     except Exception as e:
@@ -551,10 +547,7 @@ def remove_callback(update: Update, context: CallbackContext):
 
 def handle_message(update: Update, context: CallbackContext):
     try:
-        # If user is in removal process (legacy), but we now use inline keyboards,
-        # we can still keep this for safety (maybe remove later)
         if "remove_list" in context.user_data:
-            # This should not happen now, but keep for compatibility
             handle_remove_number(update, context)
             return
 
@@ -570,7 +563,6 @@ def handle_message(update: Update, context: CallbackContext):
 
         info = AmazonScraper.fetch_product_info(asin)
         db.add_product(user_id, asin, info["title"], info["url"])
-        # Update price for this new product
         product = db.execute("SELECT id FROM products WHERE user_id=%s AND asin=%s", (user_id, asin), fetch_one=True)
         if product:
             db.update_product_price(product['id'], info['price'])
@@ -595,7 +587,6 @@ def handle_message(update: Update, context: CallbackContext):
         logger.error(f"Message error: {e}")
         update.message.reply_text("❌ Error processing request")
 
-# Keep handle_remove_number for compatibility, but not used now
 def handle_remove_number(update: Update, context: CallbackContext):
     try:
         products = context.user_data["remove_list"]
@@ -621,10 +612,15 @@ def handle_remove_number(update: Update, context: CallbackContext):
 
 # ================= STOCK CHECKER FUNCTION =================
 def scheduled_stock_check(context: CallbackContext):
-    """🔄 Check every 1 minute"""
-    logger.info("🔄 Running stock check (every 1 min)...")
-    
+    """🔄 Check every 2 minutes (non-overlapping)"""
+    # Lock to prevent overlapping runs
+    if not stock_check_lock.acquire(blocking=False):
+        logger.warning("⚠️ Previous stock check still running, skipping this run.")
+        return
+
     try:
+        logger.info("🔄 Running stock check (every 2 mins)...")
+        
         products = db.get_all_products_with_users()
         
         if not products:
@@ -642,10 +638,8 @@ def scheduled_stock_check(context: CallbackContext):
                 new_status = info['status']
                 new_price = info['price']
                 
-                # Update status
                 db.update_product_status(product['id'], new_status)
                 
-                # Check for price drop (5%+)
                 if new_status == 'IN_STOCK' and new_price > 0:
                     old_price = db.update_product_price(product['id'], new_price)
                     
@@ -664,7 +658,6 @@ def scheduled_stock_check(context: CallbackContext):
                                 parse_mode=ParseMode.MARKDOWN
                             )
                 
-                # Stock change alerts
                 if old_status != new_status:
                     if old_status == 'OUT_OF_STOCK' and new_status == 'IN_STOCK':
                         logger.info(f"🔥 STOCK ALERT: {product['asin']} back in stock!")
@@ -702,13 +695,23 @@ def scheduled_stock_check(context: CallbackContext):
                 
     except Exception as e:
         logger.error(f"Stock check error: {e}")
+    finally:
+        stock_check_lock.release()
 
-# ================= HEALTH CHECK ENDPOINT =================
+# ================= FLASK APP FOR WEBHOOK =================
 health_app = Flask(__name__)
+
+# Webhook endpoint
+@health_app.route('/webhook', methods=['POST'])
+def webhook():
+    """Telegram webhook endpoint"""
+    update = Update.de_json(request.get_json(force=True), updater.bot)
+    dispatcher.process_update(update)
+    return "OK", 200
 
 @health_app.route('/')
 def home():
-    return "🤖 Amazon Bot v2.0 Running", 200
+    return "🤖 Amazon Bot v2.0 Running (Webhook)", 200
 
 @health_app.route('/health')
 def health():
@@ -720,9 +723,9 @@ def run_health_server():
 # ================= MAIN =================
 def main():
     logger.info("=" * 60)
-    logger.info("🔥 AMAZON TRACKER v2.0")
+    logger.info("🔥 AMAZON TRACKER v2.0 (Webhook Mode)")
     logger.info("✅ Price tracking + Drop alerts")
-    logger.info("✅ 1-minute checks")
+    logger.info("✅ 2-minute checks (non-overlapping)")
     logger.info("=" * 60)
     
     health_thread = threading.Thread(target=run_health_server, daemon=True)
@@ -738,17 +741,21 @@ def main():
         main()
         return
     
+    global updater, dispatcher
     updater = Updater(token=BOT_TOKEN, use_context=True)
+    dispatcher = updater.dispatcher
     
+    # Set webhook
+    webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
     try:
-        updater.bot.delete_webhook()
-        logger.info("✅ Webhook deleted")
-    except:
-        pass
+        updater.bot.set_webhook(url=webhook_url)
+        logger.info(f"✅ Webhook set to {webhook_url}")
+    except Exception as e:
+        logger.error(f"Failed to set webhook: {e}")
+        sys.exit(1)
     
-    dp = updater.dispatcher
-    job_queue = updater.job_queue
-    
+    # Add handlers
+    dp = dispatcher
     dp.add_handler(CommandHandler("start", start))
     dp.add_handler(CommandHandler("add", add))
     dp.add_handler(CommandHandler("list", list_products))
@@ -758,13 +765,19 @@ def main():
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
     dp.add_error_handler(error_handler)
     
-    # 🔥 1 MINUTE CHECKS
-    job_queue.run_repeating(scheduled_stock_check, interval=60, first=10)
-    logger.info("✅ Stock checker (every 1 minute)")
+    # 🔥 2 MINUTE CHECKS (non-overlapping)
+    job_queue = updater.job_queue
+    job_queue.run_repeating(scheduled_stock_check, interval=120, first=10)
+    logger.info("✅ Stock checker (every 2 minutes)")
     
-    updater.start_polling()
-    logger.info("✅ Bot v2.0 running!")
-    updater.idle()
+    # Start Flask webhook server (already running in thread)
+    # No polling needed
+    
+    logger.info("✅ Bot v2.0 running with webhook!")
+    
+    # Keep main thread alive (Flask is in daemon, so we need to block)
+    while True:
+        time.sleep(10)
 
 if __name__ == "__main__":
     main()
